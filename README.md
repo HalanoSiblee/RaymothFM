@@ -24,6 +24,7 @@ Next-Gen linux file manager Speed focused ⚡
 - hotkeys/look similar to windows file explorer
 - No bloatware to slow start up open in no time.
 - XDG integration
+- Progressive rendering
 
 # Dependency
 
@@ -53,3 +54,4 @@ make -j$(nproc)
 |![](./media/3.png)|![](./media/4.png)|
 |![](./media/5.png)|![](./media/6.png)|
 |![](./media/7.png)|![](./media/8.png)|
+![](./media/9.png)

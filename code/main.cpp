@@ -44,11 +44,11 @@ namespace fs = std::filesystem;
 enum class EntryKind { Directory, File, Archive };
 enum class ViewMode { Details = 1, List = 2, MediumIcons = 3, LargeIcons = 4 };
 enum class SortKey { Name, Size, Date, Type };
-enum class TextField { None, Search, Address, Rename, NewItem, Mode, ArchiveOutput, ConvertOutput, ExtractDestination, ArchivePassword, Command, ThemeNumber };
+enum class TextField { None, Search, Address, Rename, NewItem, Mode, ArchiveOutput, ConvertOutput, ExtractDestination, ArchivePassword, Command, ThemeNumber, EditorConfig, TermConfig, AccentConfig, FontScale };
 enum class ArchiveFormat { Tar, Pax, Ustar, Zip, SevenZip, Cpio };
 enum class ArchiveCompression { None, Gzip, Bzip2, Xz, Zstd, Lz4, Lzma, Lzip };
 
-enum class Modal { None, Rename, NewItem, Properties, DiskInfo, CreateArchive, ExtractArchive, ConvertImage, Cat, ImageView, Command, Help, About, ThemePicker, PasteOverwrite, Checksum };
+enum class Modal { None, Rename, NewItem, Properties, DiskInfo, CreateArchive, ExtractArchive, ConvertImage, Cat, ImageView, Command, Help, About, ThemePicker, PasteOverwrite, ConfirmPermanentDelete, Checksum };
 enum class MenuAction { None, Open, Cat, ViewImage, OpenTerminal, ConvertImage, Rename, Copy, CopyPath, Cut, Paste, Delete, PermanentDelete, Compress, Extract, OpenEditor, Refresh, NewDirectory, NewFile, Checksum, Properties };
 
 struct VfsEntry {
@@ -335,6 +335,9 @@ static Color colorHex(unsigned int rgb, unsigned char a = 255) {
     return Color{(unsigned char)((rgb >> 16) & 255), (unsigned char)((rgb >> 8) & 255), (unsigned char)(rgb & 255), a};
 }
 
+static float gUIFontScale = 1.15f;
+static inline int uiFont(int base) { return std::max(1, (int)std::lround(base * gUIFontScale)); }
+
 struct Theme {
     const char* name;
     Color bg;
@@ -368,6 +371,7 @@ struct Config {
     bool showHidden = false;
     bool showThumbnails = true;
     int thumbnailRes = 3; // 1=32, 2=64, 3=128, 4=256, 5=512
+    float fontScale = 1.15f;
     std::string editor;
     std::string term = "foot";
     std::vector<std::string> favorites;
@@ -432,6 +436,17 @@ static std::string hexRGB(Color c) {
     return buf;
 }
 
+static Color accentFromHSVField(const std::string& text, Color fallback) {
+    float h=0,sat=0,v=0;
+    if(std::sscanf(text.c_str(), "%f,%f,%f", &h, &sat, &v)==3) {
+        h=std::fmod(h,360.0f); if(h<0) h+=360.0f;
+        sat=std::clamp(sat,0.0f,1.0f); v=std::clamp(v,0.0f,1.0f);
+        return ColorFromHSV(h,sat,v);
+    }
+    unsigned rgb=parseHexRGB(text, (fallback.r<<16)|(fallback.g<<8)|fallback.b);
+    return colorHex(rgb);
+}
+
 static Config loadConfig() {
     Config c;
     c.dir = configBase() / "raymothfm";
@@ -455,6 +470,7 @@ static Config loadConfig() {
         else if (key == "show_hidden") c.showHidden = std::atoi(value.c_str()) != 0;
         else if (key == "show_thumbnails") c.showThumbnails = std::atoi(value.c_str()) != 0;
         else if (key == "thumbnail_res") c.thumbnailRes = std::clamp(std::atoi(value.c_str()), 1, 5);
+        else if (key == "font_scale") c.fontScale = std::clamp(std::strtof(value.c_str(), nullptr), 1.0f, 2.5f);
         else if (key == "editor" || key == "EDITOR") { c.editor = value; if(c.editor.size()>=2 && c.editor.front()=='"' && c.editor.back()=='"') c.editor=c.editor.substr(1,c.editor.size()-2); }
         else if (key == "term" || key == "TERM") { c.term = value; if(c.term.size()>=2 && c.term.front()=='"' && c.term.back()=='"') c.term=c.term.substr(1,c.term.size()-2); }
         else if (key == "favorite" && !value.empty()) c.favorites.push_back(value);
@@ -484,6 +500,7 @@ static void saveConfig(const Config& c, bool allowCreate = false) {
     out << "show_hidden=" << (c.showHidden ? 1 : 0) << "\n";
     out << "show_thumbnails=" << (c.showThumbnails ? 1 : 0) << "\n";
     out << "thumbnail_res=" << c.thumbnailRes << "\n";
+    out << "font_scale=" << c.fontScale << "\n";
     out << "EDITOR=\"" << c.editor << "\"\n";
     out << "TERM=\"" << c.term << "\"\n";
     for (const auto& f : c.favorites) out << "favorite=" << f << "\n";
@@ -502,6 +519,7 @@ static bool writeTemplateConfig() {
     }
     c.editor = "";
     c.term = "foot";
+    c.fontScale = 1.15f;
     c.favorites.clear();
     saveConfig(c, true);
     std::printf("raymothfm: created default config: %s\n", c.file.c_str());
@@ -685,6 +703,10 @@ struct ExplorerState {
     ArchiveOptions archive;
     int modalField = 0;
     std::string modalError;
+    std::string editorEdit;
+    std::string termEdit;
+    std::string accentEdit;
+    std::string fontScaleEdit;
     std::string renameEdit;
     std::string newItemEdit;
     PropertiesState props;
@@ -725,6 +747,7 @@ struct ExplorerState {
     std::unordered_set<std::string> thumbnailProtected;
     fs::path pendingPasteSource;
     fs::path pendingPasteDestination;
+    std::vector<fs::path> pendingPermanentDelete;
     std::string convertInput;
     std::string convertOutput;
     std::vector<std::string> convertFormats;
@@ -1160,15 +1183,18 @@ static void focus(ExplorerState& s, TextField f, bool all=false) {
     else if (f == TextField::ArchivePassword) s.editor.begin(&s.archive.password, all);
     else if (f == TextField::Command) s.editor.begin(&s.commandEdit, all);
     else if (f == TextField::ThemeNumber) s.editor.begin(&s.themeEdit, all);
+    else if (f == TextField::EditorConfig) s.editor.begin(&s.editorEdit, all);
+    else if (f == TextField::TermConfig) s.editor.begin(&s.termEdit, all);
+    else if (f == TextField::AccentConfig) s.editor.begin(&s.accentEdit, all);
+    else if (f == TextField::FontScale) s.editor.begin(&s.fontScaleEdit, all);
 }
-
 static void focusAt(ExplorerState& s, TextField f, float mouseX, float leftOffset, int fontSize=14) {
     focus(s,f,false);
     if (!s.editor.text) return;
     std::string& v=*s.editor.text;
     float target=mouseX-leftOffset;
     size_t best=0; int bestD=INT_MAX;
-    for(size_t i=0;i<=v.size();++i){ int w=MeasureText(v.substr(0,i).c_str(),fontSize); int d=std::abs((int)target-w); if(d<bestD){bestD=d;best=i;} }
+    for(size_t i=0;i<=v.size();++i){ int w=MeasureText(v.substr(0,i).c_str(),uiFont(fontSize)); int d=std::abs((int)target-w); if(d<bestD){bestD=d;best=i;} }
     s.editor.cursor=best; s.editor.anchor=best;
 }
 
@@ -1257,17 +1283,35 @@ static void completeFocusedText(ExplorerState& s) {
     s.editor.clear();
 }
 
+static int gridColumns(const ExplorerState& s) {
+    if (s.view != ViewMode::MediumIcons && s.view != ViewMode::LargeIcons) return 1;
+    const int W = GetScreenWidth();
+    const int contentW = std::max(1, static_cast<int>(W - s.sidebarW));
+    const int cellW = s.view == ViewMode::MediumIcons ? 135 : 180;
+    return std::max(1, contentW / cellW);
+}
+
 static void moveSelection(ExplorerState& s, int delta, bool page=false) {
     if (s.visibleIndices.empty()) return;
     int pos=0;
     auto it=std::find(s.visibleIndices.begin(),s.visibleIndices.end(),s.selected);
     if (it!=s.visibleIndices.end()) pos=(int)std::distance(s.visibleIndices.begin(),it);
-    else pos=0;
-    if (page) {
-        int visible=visibleRowsFor(s.view, GetScreenHeight()-120);
-        delta *= std::max(1,visible-1);
+
+    int actualDelta = delta;
+    if (s.view == ViewMode::MediumIcons || s.view == ViewMode::LargeIcons) {
+        const int cols = gridColumns(s);
+        // For icon views, callers pass row/column direction: +/-1 means left/right;
+        // +/-cols means up/down. Page movement still advances by whole rows.
+        if (page) {
+            const int rows = std::max(1, visibleRowsFor(s.view, GetScreenHeight()-120));
+            actualDelta = delta * cols * std::max(1, rows - 1);
+        }
+    } else if (page) {
+        const int visible=visibleRowsFor(s.view, GetScreenHeight()-120);
+        actualDelta = delta * std::max(1,visible-1);
     }
-    pos=std::clamp(pos+delta,0,(int)s.visibleIndices.size()-1);
+
+    pos=std::clamp(pos+actualDelta,0,(int)s.visibleIndices.size()-1);
     const int idx=s.visibleIndices[pos];
     if (isShiftDown() && s.anchorSelection>=0) selectRange(s,idx); else selectSingle(s,idx,false);
     const int visible=visibleRowsFor(s.view, GetScreenHeight()-120);
@@ -1353,9 +1397,8 @@ static bool hasSuffix(const std::string& value, const char* suffix) {
 
 static bool isSingleCompressionFile(const fs::path& p) {
     const std::string n = lowerCopy(p.filename().string());
-    return n.size() > 3 && hasSuffix(n, ".gz") && !hasSuffix(n, ".tar.gz") && !hasSuffix(n, ".tgz") ||
-           hasSuffix(n, ".zst") && !hasSuffix(n, ".tar.zst") && !hasSuffix(n, ".tzst") ||
-           false;
+    return (n.size() > 3 && hasSuffix(n, ".gz") && !hasSuffix(n, ".tar.gz") && !hasSuffix(n, ".tgz")) ||
+           (n.size() > 4 && hasSuffix(n, ".zst") && !hasSuffix(n, ".tar.zst") && !hasSuffix(n, ".tzst"));
 }
 
 static fs::path singleCompressionOutputPath(const fs::path& p) {
@@ -1439,16 +1482,17 @@ static rayicons::Icon iconForEntry(const VfsEntry& e) {
     return rayicons::FileOpen;
 }
 
-static void drawInlineEditor(Rectangle r, const std::string& v, const TextEditor& ed, const Theme& t, int fontSize) {
+static void drawInlineEditor(Rectangle r, const std::string& v, const TextEditor& ed, const Theme& t, int fs) {
+    const int fontPx = uiFont(fs);
     if (!ed.text) {
         BeginScissorMode((int)r.x+4,(int)r.y+2,std::max(1,(int)r.width-8),std::max(1,(int)r.height-4));
-        DrawText(v.c_str(),(int)r.x+10,(int)r.y+8,fontSize,t.text);
+        DrawText(v.c_str(),(int)r.x+10,(int)r.y+8,fontPx,t.text);
         EndScissorMode();
         return;
     }
     const int baseX=(int)r.x+10, baseY=(int)r.y+((int)r.height>=38?10:8);
     const int innerW=std::max(1,(int)r.width-16);
-    const auto measurePrefix = [&](size_t n){ return MeasureText(v.substr(0,n).c_str(),fontSize); };
+    const auto measurePrefix = [&](size_t n){ return MeasureText(v.substr(0,n).c_str(),fontPx); };
     int anchorPixel=measurePrefix(ed.cursor);
     int scrollX=std::max(0, anchorPixel-innerW);
     if (anchorPixel-scrollX < 0) scrollX=anchorPixel;
@@ -1458,9 +1502,9 @@ static void drawInlineEditor(Rectangle r, const std::string& v, const TextEditor
     if (ed.hasSelection()) {
         const int a=measurePrefix(ed.lo())-scrollX;
         const int b=measurePrefix(ed.hi())-scrollX;
-        DrawRectangle(drawX+a,baseY+1,std::max(1,b-a),fontSize+2,Fade(t.accent,0.30f));
+        DrawRectangle(drawX+a,baseY+1,std::max(1,b-a),fs+2,Fade(t.accent,0.30f));
     }
-    DrawText(v.c_str(),drawX,baseY,fontSize,t.text);
+    DrawText(v.c_str(),drawX,baseY,fontPx,t.text);
     if (ed.cursor<=v.size()) {
         const int tw=measurePrefix(ed.cursor)-scrollX;
         DrawLine(baseX+tw,(int)r.y+6,baseX+tw,(int)r.y+r.height-6,t.accent);
@@ -1845,6 +1889,37 @@ static bool xdgTrash(const fs::path& p) {
     return runCommandPath("trash-put",p);
 }
 
+static void openPermanentDeleteConfirm(ExplorerState& s) {
+    if (!s.vfs || !s.vfs->isLocal()) return;
+    s.pendingPermanentDelete.clear();
+    for (int idx : selectedRows(s)) {
+        if (idx >= 0 && idx < (int)s.rows.size()) s.pendingPermanentDelete.emplace_back(s.rows[idx].path);
+    }
+    if (s.pendingPermanentDelete.empty()) return;
+    s.modal = Modal::ConfirmPermanentDelete;
+    s.modalError.clear();
+    s.menu.open = false;
+    unfocus(s);
+}
+
+static void applyPermanentDelete(ExplorerState& s) {
+    if (!s.vfs || !s.vfs->isLocal() || s.pendingPermanentDelete.empty()) return;
+    std::string error;
+    for (const fs::path& p : s.pendingPermanentDelete) {
+        if (!removeRecursive(p, error)) {
+            s.status = "Permanent delete failed: " + error;
+            s.modal = Modal::None;
+            s.pendingPermanentDelete.clear();
+            return;
+        }
+    }
+    const size_t count = s.pendingPermanentDelete.size();
+    s.pendingPermanentDelete.clear();
+    s.modal = Modal::None;
+    refresh(s);
+    s.status = "Permanently deleted " + std::to_string(count) + (count == 1 ? " item" : " items");
+}
+
 static void deleteSelection(ExplorerState& s, bool permanent=false) {
     if (!s.vfs || !s.vfs->isLocal()) return;
     std::string error;
@@ -2171,8 +2246,8 @@ static int visibleRowsFor(ViewMode v,int h){return v==ViewMode::Details?std::max
 
 static void drawCheckbox(Rectangle r, bool checked, const char* label, Color text, Color accent) {
     DrawRectangleLinesEx(r,1,checked?accent:text);
-    if (checked) { DrawRectangleRec({r.x+3,r.y+3,r.width-6,r.height-6},accent); DrawText("x",(int)r.x+4,(int)r.y+1,12,WHITE); }
-    DrawText(label,(int)r.x+r.width+7,(int)r.y+1,13,text);
+    if (checked) { DrawRectangleRec({r.x+3,r.y+3,r.width-6,r.height-6},accent); DrawText("x",(int)r.x+4,(int)r.y+1, uiFont(12), WHITE); }
+    DrawText(label,(int)r.x+r.width+7,(int)r.y+1, uiFont(13), text);
 }
 
 static bool archivePasswordUIEnabled(const ArchiveOptions& o);
@@ -2331,98 +2406,119 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
     DrawRectangle(0,0,W,H,Fade(BLACK,0.62f));
     const bool largeDialog=(s.modal==Modal::Help);
     Rectangle box{W*0.5f-(largeDialog?350.0f:290.0f),H*0.5f-(largeDialog?280.0f:220.0f),largeDialog?700.0f:580.0f,largeDialog?560.0f:440.0f};
-    DrawRectangleRec(box,t.panel2); DrawRectangleLinesEx(box,1,t.line);
-    const std::string title = s.modal==Modal::Properties?"Properties":s.modal==Modal::DiskInfo?"Disk usage":s.modal==Modal::Rename?"Rename":s.modal==Modal::NewItem?(s.flags.newItemDirectory?"New directory":"New file"):s.modal==Modal::CreateArchive?"Create archive":s.modal==Modal::ExtractArchive?"Extract archive":s.modal==Modal::ConvertImage?"Convert image":s.modal==Modal::Command?"Run command here":s.modal==Modal::Help?"Keyboard shortcuts":s.modal==Modal::About?"About raymothfm":s.modal==Modal::ThemePicker?"Theme picker":s.modal==Modal::PasteOverwrite?"Confirm overwrite":s.modal==Modal::Checksum?"Checksum":"raymothfm";
-    DrawText(title.c_str(),(int)box.x+20,(int)box.y+18,20,t.text);
+    DrawRectangleRec(box,t.panel2); DrawRectangleLinesEx(box, 1, t.line);
+    const std::string title = s.modal==Modal::Properties?"Properties":s.modal==Modal::DiskInfo?"Disk usage":s.modal==Modal::Rename?"Rename":s.modal==Modal::NewItem?(s.flags.newItemDirectory?"New directory":"New file"):s.modal==Modal::CreateArchive?"Create archive":s.modal==Modal::ExtractArchive?"Extract archive":s.modal==Modal::ConvertImage?"Convert image":s.modal==Modal::Command?"Run command here":s.modal==Modal::Help?"Keyboard shortcuts":s.modal==Modal::About?"About raymothfm":s.modal==Modal::ThemePicker?"Theme picker":s.modal==Modal::PasteOverwrite?"Confirm overwrite":s.modal==Modal::ConfirmPermanentDelete?"Permanent delete":s.modal==Modal::Checksum?"Checksum":"raymothfm";
+    DrawText(title.c_str(),(int)box.x+20,(int)box.y+18, uiFont(20), t.text);
 
 
 
     if (s.modal==Modal::Checksum) {
-        DrawText(s.checksumName.c_str(), (int)box.x+20, (int)box.y+68, 14, t.text);
-        DrawText(s.checksumPath.c_str(), (int)box.x+20, (int)box.y+95, 11, t.muted);
-        DrawText("Digest:", (int)box.x+20, (int)box.y+145, 13, t.muted);
+        DrawText(s.checksumName.c_str(), (int)box.x+20, (int)box.y+68, uiFont(14), t.text);
+        DrawText(s.checksumPath.c_str(), (int)box.x+20, (int)box.y+95, uiFont(11), t.muted);
+        DrawText("Digest:", (int)box.x+20, (int)box.y+145, uiFont(13), t.muted);
         Rectangle hashR{box.x+20, box.y+172, box.width-40, 42};
         DrawRectangleRec(hashR, t.panel); DrawRectangleLinesEx(hashR, 1, t.line);
         const bool good = s.checksumValue.rfind("ERROR:",0) != 0 && s.checksumValue != "Calculating...";
-        DrawText(s.checksumValue.c_str(), (int)hashR.x+10, (int)hashR.y+12, 14, good ? t.text : t.muted);
-        DrawText("Click the digest to copy it to the clipboard", (int)box.x+20, (int)box.y+235, 12, t.muted);
-        Rectangle closeR{box.x+440,box.y+344,90,32}; DrawRectangleRec(closeR,t.panel); DrawRectangleLinesEx(closeR,1,t.line); DrawText("Close",(int)closeR.x+24,(int)closeR.y+9,13,t.text);
+        DrawText(s.checksumValue.c_str(), (int)hashR.x+10, (int)hashR.y+12, uiFont(14), good ? t.text : t.muted);
+        DrawText("Click the digest to copy it to the clipboard", (int)box.x+20, (int)box.y+235, uiFont(12), t.muted);
+        Rectangle closeR{box.x+440,box.y+344,90,32}; DrawRectangleRec(closeR,t.panel); DrawRectangleLinesEx(closeR, 1, t.line); DrawText("Close",(int)closeR.x+24,(int)closeR.y+9, uiFont(13), t.text);
+        return;
+    }
+
+    if (s.modal==Modal::ConfirmPermanentDelete) {
+        const size_t count = s.pendingPermanentDelete.size();
+        DrawText("This action cannot be undone.", (int)box.x+20, (int)box.y+70, uiFont(15), t.text);
+        DrawText((std::to_string(count) + (count == 1 ? " item will be permanently deleted." : " items will be permanently deleted.")).c_str(),
+                 (int)box.x+20, (int)box.y+100, uiFont(13), t.muted);
+        if (!s.pendingPermanentDelete.empty()) {
+            std::string label = s.pendingPermanentDelete.front().filename().string();
+            if (count > 1) label += "  (and " + std::to_string(count-1) + " more)";
+            DrawText(label.c_str(), (int)box.x+20, (int)box.y+130, uiFont(12), t.muted);
+        }
+        Rectangle apply{box.x+350,box.y+180,110,34}, cancel{box.x+470,box.y+180,70,34};
+        DrawRectangleRec(apply, t.accent); DrawText("Delete", (int)apply.x+29, (int)apply.y+9, uiFont(13), t.bg);
+        DrawRectangleLinesEx(cancel, 1, t.line); DrawText("Cancel", (int)cancel.x+12, (int)cancel.y+9, uiFont(12), t.text);
+        DrawText("Enter = delete permanently    Esc = cancel", (int)box.x+20, (int)box.y+240, uiFont(12), t.muted);
         return;
     }
 
     if (s.modal==Modal::PasteOverwrite) {
-        DrawText("A file or directory with this name already exists.", (int)box.x+20,(int)box.y+68,14,t.text);
-        DrawText(s.pendingPasteDestination.filename().string().c_str(), (int)box.x+20,(int)box.y+98,13,t.muted);
-        DrawText("Replace the existing item?", (int)box.x+20,(int)box.y+126,13,t.text);
+        DrawText("A file or directory with this name already exists.", (int)box.x+20,(int)box.y+68, uiFont(14), t.text);
+        DrawText(s.pendingPasteDestination.filename().string().c_str(), (int)box.x+20,(int)box.y+98, uiFont(13), t.muted);
+        DrawText("Replace the existing item?", (int)box.x+20,(int)box.y+126, uiFont(13), t.text);
         Rectangle apply{box.x+360,box.y+180,100,32}, cancel{box.x+470,box.y+180,70,32};
-        DrawRectangleRec(apply,t.accent); DrawText("Overwrite",(int)apply.x+10,(int)apply.y+8,12,t.bg);
-        DrawRectangleLinesEx(cancel,1,t.line); DrawText("Cancel",(int)cancel.x+12,(int)cancel.y+8,12,t.text);
+        DrawRectangleRec(apply,t.accent); DrawText("Overwrite",(int)apply.x+10,(int)apply.y+8, uiFont(12), t.bg);
+        DrawRectangleLinesEx(cancel, 1, t.line); DrawText("Cancel",(int)cancel.x+12,(int)cancel.y+8, uiFont(12), t.text);
         return;
     }
 
     if (s.modal==Modal::ThemePicker) {
-        DrawText("Theme number (0-10)",(int)box.x+20,(int)box.y+60,13,t.muted);
-        Rectangle field{box.x+20,box.y+82,170,36};
-        DrawRectangleRec(field,t.bg); DrawRectangleLinesEx(field,1,t.accent);
-        DrawText(s.themeEdit.c_str(),(int)field.x+8,(int)field.y+9,15,t.text);
-        if (s.focusedField==TextField::ThemeNumber) {
-            int tw=MeasureText(s.themeEdit.c_str(),15);
-            DrawLine((int)field.x+8+tw,(int)field.y+7,(int)field.x+8+tw,(int)field.y+29,t.accent);
-        }
-        int yy=(int)box.y+140;
-        for (int i=0;i<(int)kThemes.size();++i) {
-            Color c = (i==s.config.theme)?t.accent:t.text;
-            DrawText((std::to_string(i)+"  "+kThemes[i].name).c_str(),(int)box.x+20,yy,12,c);
-            yy+=20;
-        }
+        DrawText("Theme / Appearance",(int)box.x+20,(int)box.y+50, uiFont(15), t.accent);
+        auto field=[&](Rectangle rr,const char* label,TextField tf,const std::string& value){
+            DrawText(label,(int)rr.x,(int)rr.y-16,uiFont(10),t.muted);
+            DrawRectangleRec(rr,t.bg); DrawRectangleLinesEx(rr,1,s.focusedField==tf?t.accent:t.line);
+            if(s.focusedField==tf) drawInlineEditor(rr,value,s.editor,t,13); else {
+                BeginScissorMode((int)rr.x+1,(int)rr.y+1,std::max(1,(int)rr.width-2),std::max(1,(int)rr.height-2));
+                DrawText(value.c_str(),(int)rr.x+8,(int)rr.y+9,uiFont(13),t.text);
+                EndScissorMode();
+            }
+        };
+        field({box.x+20,box.y+92,150,34},"Theme number (0-10)",TextField::ThemeNumber,s.themeEdit);
+        field({box.x+20,box.y+152,270,34},"EDITOR",TextField::EditorConfig,s.editorEdit);
+        field({box.x+20,box.y+212,270,34},"TERM",TextField::TermConfig,s.termEdit);
+        field({box.x+20,box.y+272,170,34},"Font scale (1.0-2.5)",TextField::FontScale,s.fontScaleEdit);
+        field({box.x+200,box.y+272,170,34},"Accent #RRGGBB",TextField::AccentConfig,s.accentEdit);
+        Rectangle hsvBtn{box.x+380,box.y+272,62,34}; DrawRectangleRec(hsvBtn,t.panel); DrawRectangleLinesEx(hsvBtn,1,t.accent); DrawText("HSV",(int)hsvBtn.x+17,(int)hsvBtn.y+9,uiFont(11),t.text);
+        DrawText("Themes",(int)box.x+330,(int)box.y+76,uiFont(12),t.muted);
+        int yy=(int)box.y+100; for(int i=0;i<(int)kThemes.size();++i){ Color c=(i==s.config.theme)?t.accent:t.text; DrawText((std::to_string(i)+"  "+kThemes[i].name).c_str(),(int)box.x+330,yy,uiFont(10),c); yy+=17; }
         Rectangle apply{box.x+390,box.y+360,85,32},cancel{box.x+485,box.y+360,65,32};
-        DrawRectangleRec(apply,t.panel); DrawRectangleLinesEx(apply,1,t.accent); DrawText("Apply",(int)apply.x+20,(int)apply.y+9,13,t.text);
-        DrawRectangleRec(cancel,t.panel); DrawRectangleLinesEx(cancel,1,t.line); DrawText("Cancel",(int)cancel.x+10,(int)cancel.y+9,13,t.text);
-        DrawText("Enter = apply    Esc = cancel",(int)box.x+300,(int)box.y+95,12,t.muted);
+        DrawRectangleRec(apply,t.panel); DrawRectangleLinesEx(apply,1,t.accent); DrawText("Apply",(int)apply.x+20,(int)apply.y+9,uiFont(13),t.text);
+        DrawRectangleRec(cancel,t.panel); DrawRectangleLinesEx(cancel,1,t.line); DrawText("Cancel",(int)cancel.x+10,(int)cancel.y+9,uiFont(13),t.text);
+        DrawText("Enter = apply    Esc = cancel    HSV = random accent",(int)box.x+20,(int)box.y+360,uiFont(10),t.muted);
         return;
     }
 
     if (s.modal==Modal::Help) {
-        DrawText("Navigation",(int)box.x+20,(int)box.y+58,15,t.accent);
+        DrawText("Navigation",(int)box.x+20,(int)box.y+58, uiFont(15), t.accent);
         const char* lines[] = {
             "/                 Focus path (keep text)", "Ctrl+/             Clear + focus path", "Ctrl+L             Focus/select path", "Tab                Complete path/command", "Enter              Open / activate", "Arrow keys         Navigate selection", "PageUp/PageDown    Page through items", "Backspace          Parent directory", "Alt+Left/Right     History", "Ctrl+T/W/Tab        New/close/switch tab",
-            "Ctrl+1..9          Switch tab", "Ctrl+F             Focus search", "Ctrl+H             Show/hide hidden files", "Ctrl+A             Select all", "Ctrl+C/X/V         Copy/cut/paste", "Delete / Shift+Del Trash / permanent delete", "F2                 Rename", "F7 / Ctrl+Shift+N   New directory", "Ctrl+Alt+N          New file", "F6                 cat / text viewer", "F8                 Copy current directory path", "F9                 Open terminal here", "Ctrl+Shift+A        Compress", "X                  Extract selected archive", "Ctrl+Wheel          Change view zoom", "1..4               Details/List/Medium/Large", "F3                 Theme picker (0..10)", "`                  Run command here", "Tab                Path/command completion", "F1                 This help", "F4                About", "Config: show_thumbnails=1 + thumbnail_res=1..5 (32/64/128/256/512px); thumbnails use a visible-set-aware bounded cache (96 medium / 48 large).", "Ctrl+Q             Quit", "Esc                Close active window/menu"
+            "Ctrl+1..9          Switch tab", "Ctrl+F             Focus search", "Ctrl+H             Show/hide hidden files", "Ctrl+A             Select all", "Ctrl+C/X/V         Copy/cut/paste", "Delete / Shift+Del Trash / permanent delete", "F2                 Rename", "F7 / Ctrl+Shift+N   New directory", "Ctrl+Alt+N          New file", "F6                 cat / text viewer", "F8                 Copy current directory path", "F9                 Open terminal here", "Ctrl+Home          Jump to Home", "Ctrl+Shift+A        Compress", "X                  Extract selected archive", "Ctrl+Wheel          Change view zoom", "1..4               Details/List/Medium/Large", "F3                 Theme picker (0..10)", "`                  Run command here", "Tab                Path/command completion", "F1                 This help", "F4                About", "Config: show_thumbnails=1 + thumbnail_res=1..5 (32/64/128/256/512px); thumbnails use a visible-set-aware bounded cache (96 medium / 48 large).", "Ctrl+Q             Quit", "Esc                Close active window/menu"
         };
-        int y=(int)box.y+86; for(const char* line:lines){ DrawText(line,(int)box.x+20,y,12,t.text); y+=14; if(y>box.y+392) break; }
-        DrawText("Details view always shows Name, Date modified, Type and Size.",(int)box.x+20,(int)box.y+402,12,t.muted);
+        int y=(int)box.y+86; for(const char* line:lines){ DrawText(line,(int)box.x+20,y, uiFont(12), t.text); y+=14; if(y>box.y+392) break; }
+        DrawText("Details view always shows Name, Date modified, Type and Size.",(int)box.x+20,(int)box.y+402, uiFont(12), t.muted);
         return;
     }
     if (s.modal==Modal::About) {
-        DrawText("raymothfm",(int)box.x+20,(int)box.y+72,30,t.text);
-        DrawText("A fast Linux file manager built with raylib.",(int)box.x+20,(int)box.y+112,14,t.muted);
-        DrawText("VFS / libarchive / libmagic / XDG integration / 7z / OpenSSL / libvips",(int)box.x+20,(int)box.y+138,13,t.text);
-        DrawText(RAYMOTHFM_VERSION,(int)box.x+20,(int)box.y+164,13,t.text);
-        DrawText("Made with <3 by @HalanoSiblee The Smart Moth",(int)box.x+20,(int)box.y+190,13,t.text);
-        DrawText("F1 = shortcuts    Esc = close",(int)box.x+20,(int)box.y+220,13,t.muted);
+        DrawText("raymothfm",(int)box.x+20,(int)box.y+72, uiFont(30), t.text);
+        DrawText("A fast Linux file manager built with raylib.",(int)box.x+20,(int)box.y+112, uiFont(14), t.muted);
+        DrawText("VFS / libarchive / libmagic / XDG integration / 7z / OpenSSL / libvips",(int)box.x+20,(int)box.y+138, uiFont(13), t.text);
+        DrawText(RAYMOTHFM_VERSION,(int)box.x+20,(int)box.y+164, uiFont(13), t.text);
+        DrawText("Made with <3 by @HalanoSiblee The Smart Moth",(int)box.x+20,(int)box.y+190, uiFont(13), t.text);
+        DrawText("F1 = shortcuts    Esc = close",(int)box.x+20,(int)box.y+220, uiFont(13), t.muted);
         return;
     }
 
     if (s.modal==Modal::ImageView) {
         if(s.imageTexture.id){
             float scale=s.flags.imageFit?std::min((box.width-40)/s.imageW,(box.height-80)/s.imageH):s.imageZoom;
-            scale=std::max(0.05f,scale); float dw=s.imageW*scale, dh=s.imageH*scale; Rectangle dst{box.x+(box.width-dw)/2+s.imagePan.x,box.y+60+(box.height-80-dh)/2+s.imagePan.y,dw,dh}; DrawTexturePro(s.imageTexture,{0,0,(float)s.imageTexture.width,(float)s.imageTexture.height},dst,{0,0},0,WHITE);
-            char info[160]; std::snprintf(info,sizeof(info),"%dx%d  %.0f%%   +/- / wheel = zoom   drag = pan   F = fit   Esc = close",s.imageW,s.imageH,scale*100.0f); DrawText(info,(int)box.x+20,(int)(box.y+box.height-24),12,t.muted);
+            scale=std::max(0.05f,scale); float dw=s.imageW*scale, dh=s.imageH*scale; Rectangle dst{box.x+(box.width-dw)/2+s.imagePan.x,box.y+60+(box.height-80-dh)/2+s.imagePan.y,dw,dh}; DrawTexturePro(s.imageTexture,{0,0,(float)s.imageTexture.width,(float)s.imageTexture.height},dst,{0,0}, uiFont(0), WHITE);
+            char info[160]; std::snprintf(info,sizeof(info),"%dx%d  %.0f%%   +/- / wheel = zoom   drag = pan   F = fit   Esc = close",s.imageW,s.imageH,scale*100.0f); DrawText(info,(int)box.x+20,(int)(box.y+box.height-24), uiFont(12), t.muted);
         }
         return;
     }
 
     if (s.modal==Modal::ConvertImage) {
-        DrawText("Input",(int)box.x+20,(int)box.y+52,12,t.muted);
+        DrawText("Input",(int)box.x+20,(int)box.y+52, uiFont(12), t.muted);
         BeginScissorMode((int)box.x+18,(int)box.y+62,(int)box.width-36,20);
-        DrawText(s.convertInput.c_str(),(int)box.x+20,(int)box.y+71,12,t.text);
+        DrawText(s.convertInput.c_str(),(int)box.x+20,(int)box.y+71, uiFont(12), t.text);
         EndScissorMode();
-        DrawText("Output",(int)box.x+20,(int)box.y+96,12,t.muted);
+        DrawText("Output",(int)box.x+20,(int)box.y+96, uiFont(12), t.muted);
         Rectangle out{box.x+20,box.y+106,box.width-40,38}; DrawRectangleRec(out,t.bg); DrawRectangleLinesEx(out,1,s.focusedField==TextField::ConvertOutput?t.accent:t.line);
         if(s.focusedField==TextField::ConvertOutput) {
             drawInlineEditor(out,s.convertOutput,s.editor,t,13);
         } else {
             BeginScissorMode((int)out.x+8,(int)out.y+3,(int)out.width-16,(int)out.height-6);
-            DrawText(s.convertOutput.c_str(),(int)out.x+8,(int)out.y+11,13,t.text);
+            DrawText(s.convertOutput.c_str(),(int)out.x+8,(int)out.y+11, uiFont(13), t.text);
             EndScissorMode();
         }
         const char* labels[]={"Format","Quality","Effort","Compression","Bit depth","Lossless","Strip metadata"};
@@ -2435,133 +2531,133 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
             else if(i==4) enabled=convertBitDepthEnabled(s);
             else if(i==5) enabled=convertLosslessEnabled(s);
             Color tc=enabled?t.text:t.muted;
-            DrawText(labels[i],(int)bx,(int)by,11,enabled?t.muted:t.line);
+            DrawText(labels[i],(int)bx,(int)by, uiFont(11), enabled?t.muted:t.line);
             Rectangle rr{bx,by+12,255,28}; DrawRectangleRec(rr,enabled?t.panel:Fade(t.panel,0.55f));
             DrawRectangleLinesEx(rr,1,s.modalField==i? (enabled?t.accent:t.line):t.line);
-            DrawText(convertFieldValue(s,i),(int)rr.x+8,(int)rr.y+7,13,tc);
+            DrawText(convertFieldValue(s,i),(int)rr.x+8,(int)rr.y+7, uiFont(13), tc);
         }
-        Rectangle apply{box.x+340,box.y+360,110,34},cancel{box.x+460,box.y+360,90,34}; DrawRectangleRec(apply,t.accent); DrawText("Convert",(int)apply.x+27,(int)apply.y+10,13,t.bg); DrawRectangleRec(cancel,t.panel); DrawRectangleLinesEx(cancel,1,t.line); DrawText("Cancel",(int)cancel.x+22,(int)cancel.y+10,13,t.text);
+        Rectangle apply{box.x+340,box.y+360,110,34},cancel{box.x+460,box.y+360,90,34}; DrawRectangleRec(apply,t.accent); DrawText("Convert",(int)apply.x+27,(int)apply.y+10, uiFont(13), t.bg); DrawRectangleRec(cancel,t.panel); DrawRectangleLinesEx(cancel, 1, t.line); DrawText("Cancel",(int)cancel.x+22,(int)cancel.y+10, uiFont(13), t.text);
         const int errorY = !s.modalError.empty() ? (int)box.y+327 : -1;
         if(errorY >= 0) {
             BeginScissorMode((int)box.x+18,errorY,(int)box.width-36,16);
-            DrawText(s.modalError.c_str(),(int)box.x+20,errorY,10,Color{255,100,100,255});
+            DrawText(s.modalError.c_str(),(int)box.x+20,errorY, uiFont(10), Color{255,100,100,255});
             EndScissorMode();
         }
         const int helpY = !s.modalError.empty() ? (int)box.y+344 : (int)box.y+330;
-        DrawText("Click parameter: cycle    LMB/RMB = next/previous    Enter = convert    Esc = cancel",(int)box.x+20,helpY,11,t.muted);
+        DrawText("Click parameter: cycle    LMB/RMB = next/previous    Enter = convert    Esc = cancel",(int)box.x+20,helpY, uiFont(11), t.muted);
         return;
     }
 
     if (s.modal==Modal::Command) {
-        DrawText("Current directory",(int)box.x+20,(int)box.y+55,12,t.muted);
-        DrawText(s.path.c_str(),(int)box.x+20,(int)box.y+74,12,t.text);
+        DrawText("Current directory",(int)box.x+20,(int)box.y+55, uiFont(12), t.muted);
+        DrawText(s.path.c_str(),(int)box.x+20,(int)box.y+74, uiFont(12), t.text);
         Rectangle field{box.x+20,box.y+100,box.width-40,38};
-        DrawRectangleRec(field,t.bg); DrawRectangleLinesEx(field,1,t.accent);
+        DrawRectangleRec(field,t.bg); DrawRectangleLinesEx(field, 1, t.accent);
         const std::string& v=s.commandEdit;
-        DrawText(v.c_str(),(int)field.x+8,(int)field.y+10,14,t.text);
-        if(s.editor.hasSelection()){ const int a=MeasureText(v.substr(0,s.editor.lo()).c_str(),14), b=MeasureText(v.substr(0,s.editor.hi()).c_str(),14); DrawRectangle((int)field.x+8+a,(int)field.y+8,b-a,17,Fade(t.accent,0.35f)); }
-        else { const int tw=MeasureText(v.substr(0,s.editor.cursor).c_str(),14); DrawLine((int)field.x+8+tw,(int)field.y+7,(int)field.x+8+tw,(int)field.y+30,t.accent); }
-        DrawText("Enter = run    Esc = cancel    Ctrl+A/C/X/V = edit",(int)box.x+20,(int)box.y+160,12,t.muted);
+        DrawText(v.c_str(),(int)field.x+8,(int)field.y+10, uiFont(14), t.text);
+        if(s.editor.hasSelection()){ const int a=MeasureText(v.substr(0,s.editor.lo()).c_str(),uiFont(14)), b=MeasureText(v.substr(0,s.editor.hi()).c_str(),uiFont(14)); DrawRectangle((int)field.x+8+a,(int)field.y+8,b-a,17,Fade(t.accent,0.35f)); }
+        else { const int tw=MeasureText(v.substr(0,s.editor.cursor).c_str(),uiFont(14)); DrawLine((int)field.x+8+tw,(int)field.y+7,(int)field.x+8+tw,(int)field.y+30,t.accent); }
+        DrawText("Enter = run    Esc = cancel    Ctrl+A/C/X/V = edit",(int)box.x+20,(int)box.y+160, uiFont(12), t.muted);
         return;
     }
 
     if (s.modal==Modal::Rename) {
-        DrawText("New name",(int)box.x+20,(int)box.y+70,13,t.muted);
-        Rectangle field{box.x+20,box.y+95,box.width-240,38}; DrawRectangleRec(field,t.bg); DrawRectangleLinesEx(field,1,t.accent);
-        const std::string& v=s.renameEdit; DrawText(v.c_str(),(int)field.x+8,(int)field.y+10,14,t.text);
+        DrawText("New name",(int)box.x+20,(int)box.y+70, uiFont(13), t.muted);
+        Rectangle field{box.x+20,box.y+95,box.width-240,38}; DrawRectangleRec(field,t.bg); DrawRectangleLinesEx(field, 1, t.accent);
+        const std::string& v=s.renameEdit; DrawText(v.c_str(),(int)field.x+8,(int)field.y+10, uiFont(14), t.text);
         if (s.focusedField==TextField::Rename) {
-            const int tw=MeasureText(v.substr(0,s.editor.cursor).c_str(),14); DrawLine((int)field.x+8+tw,(int)field.y+7,(int)field.x+8+tw,(int)field.y+30,t.accent);
+            const int tw=MeasureText(v.substr(0,s.editor.cursor).c_str(),uiFont(14)); DrawLine((int)field.x+8+tw,(int)field.y+7,(int)field.x+8+tw,(int)field.y+30,t.accent);
         }
-        if (s.editor.hasSelection()) { const int a=MeasureText(v.substr(0,s.editor.lo()).c_str(),14), b=MeasureText(v.substr(0,s.editor.hi()).c_str(),14); DrawRectangle((int)field.x+8+a,(int)field.y+8,b-a,17,Fade(t.accent,0.35f)); DrawText(v.substr(s.editor.lo(),s.editor.hi()-s.editor.lo()).c_str(),(int)field.x+8+a,(int)field.y+10,14,t.text); }
-        DrawText("Enter = rename    Esc = cancel",(int)box.x+20,(int)box.y+155,13,t.muted);
-        DrawRectangleRec({box.x+390,box.y+105,85,32},t.panel); DrawRectangleLinesEx({box.x+390,box.y+105,85,32},1,t.line); DrawText("Rename",(int)box.x+408,(int)box.y+114,13,t.text);
-        DrawRectangleRec({box.x+485,box.y+105,65,32},t.panel); DrawRectangleLinesEx({box.x+485,box.y+105,65,32},1,t.line); DrawText("Cancel",(int)box.x+496,(int)box.y+114,13,t.text);
-        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+190,13,Color{255,100,100,255});
+        if (s.editor.hasSelection()) { const int a=MeasureText(v.substr(0,s.editor.lo()).c_str(),uiFont(14)), b=MeasureText(v.substr(0,s.editor.hi()).c_str(),uiFont(14)); DrawRectangle((int)field.x+8+a,(int)field.y+8,b-a,17,Fade(t.accent,0.35f)); DrawText(v.substr(s.editor.lo(),s.editor.hi()-s.editor.lo()).c_str(),(int)field.x+8+a,(int)field.y+10, uiFont(14), t.text); }
+        DrawText("Enter = rename    Esc = cancel",(int)box.x+20,(int)box.y+155, uiFont(13), t.muted);
+        DrawRectangleRec({box.x+390,box.y+105,85,32},t.panel); DrawRectangleLinesEx({box.x+390,box.y+105,85,32}, 1, t.line); DrawText("Rename",(int)box.x+408,(int)box.y+114, uiFont(13), t.text);
+        DrawRectangleRec({box.x+485,box.y+105,65,32},t.panel); DrawRectangleLinesEx({box.x+485,box.y+105,65,32}, 1, t.line); DrawText("Cancel",(int)box.x+496,(int)box.y+114, uiFont(13), t.text);
+        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+190, uiFont(13), Color{255,100,100,255});
         return;
     }
 
     if (s.modal==Modal::NewItem) {
-        DrawText(s.flags.newItemDirectory ? "Directory name" : "File name", (int)box.x+20, (int)box.y+70, 13, t.muted);
+        DrawText(s.flags.newItemDirectory ? "Directory name" : "File name", (int)box.x+20, (int)box.y+70, uiFont(13), t.muted);
         Rectangle field{box.x+20,box.y+95,box.width-240,38};
-        DrawRectangleRec(field,t.bg); DrawRectangleLinesEx(field,1,t.accent);
+        DrawRectangleRec(field,t.bg); DrawRectangleLinesEx(field, 1, t.accent);
         const std::string& v=s.newItemEdit;
-        DrawText(v.c_str(),(int)field.x+8,(int)field.y+10,14,t.text);
+        DrawText(v.c_str(),(int)field.x+8,(int)field.y+10, uiFont(14), t.text);
         if (s.editor.hasSelection()) {
-            const int a=MeasureText(v.substr(0,s.editor.lo()).c_str(),14);
-            const int b=MeasureText(v.substr(0,s.editor.hi()).c_str(),14);
+            const int a=MeasureText(v.substr(0,s.editor.lo()).c_str(),uiFont(14));
+            const int b=MeasureText(v.substr(0,s.editor.hi()).c_str(),uiFont(14));
             DrawRectangle((int)field.x+8+a,(int)field.y+8,b-a,17,Fade(t.accent,0.35f));
-            DrawText(v.substr(s.editor.lo(),s.editor.hi()-s.editor.lo()).c_str(),(int)field.x+8+a,(int)field.y+10,14,t.text);
+            DrawText(v.substr(s.editor.lo(),s.editor.hi()-s.editor.lo()).c_str(),(int)field.x+8+a,(int)field.y+10, uiFont(14), t.text);
         } else if (s.focusedField==TextField::NewItem) {
-            const int tw=MeasureText(v.substr(0,s.editor.cursor).c_str(),14);
+            const int tw=MeasureText(v.substr(0,s.editor.cursor).c_str(),uiFont(14));
             DrawLine((int)field.x+8+tw,(int)field.y+7,(int)field.x+8+tw,(int)field.y+30,t.accent);
         }
-        DrawText("Enter = create    Esc = cancel",(int)box.x+20,(int)box.y+155,13,t.muted);
-        DrawRectangleRec({box.x+390,box.y+105,85,32},t.panel); DrawRectangleLinesEx({box.x+390,box.y+105,85,32},1,t.accent); DrawText("Create",(int)box.x+407,(int)box.y+114,13,t.text);
-        DrawRectangleRec({box.x+485,box.y+105,65,32},t.panel); DrawRectangleLinesEx({box.x+485,box.y+105,65,32},1,t.line); DrawText("Cancel",(int)box.x+496,(int)box.y+114,13,t.text);
-        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+190,13,Color{255,100,100,255});
+        DrawText("Enter = create    Esc = cancel",(int)box.x+20,(int)box.y+155, uiFont(13), t.muted);
+        DrawRectangleRec({box.x+390,box.y+105,85,32},t.panel); DrawRectangleLinesEx({box.x+390,box.y+105,85,32}, 1, t.accent); DrawText("Create",(int)box.x+407,(int)box.y+114, uiFont(13), t.text);
+        DrawRectangleRec({box.x+485,box.y+105,65,32},t.panel); DrawRectangleLinesEx({box.x+485,box.y+105,65,32}, 1, t.line); DrawText("Cancel",(int)box.x+496,(int)box.y+114, uiFont(13), t.text);
+        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+190, uiFont(13), Color{255,100,100,255});
         return;
     }
 
 
     if (s.modal==Modal::CreateArchive || s.modal==Modal::ExtractArchive) {
         if (s.modal==Modal::ExtractArchive) {
-            DrawText("Destination",(int)box.x+20,(int)box.y+54,12,t.muted);
+            DrawText("Destination",(int)box.x+20,(int)box.y+54, uiFont(12), t.muted);
             Rectangle dest{box.x+20,box.y+74,box.width-40,34}; DrawRectangleRec(dest,t.bg); DrawRectangleLinesEx(dest,1,s.focusedField==TextField::ExtractDestination?t.accent:t.line);
-            if(s.focusedField==TextField::ExtractDestination) drawInlineEditor(dest,s.archive.destination,s.editor,t,13); else DrawText(s.archive.destination.c_str(),(int)dest.x+8,(int)dest.y+9,13,t.text);
+            if(s.focusedField==TextField::ExtractDestination) drawInlineEditor(dest,s.archive.destination,s.editor,t,13); else DrawText(s.archive.destination.c_str(),(int)dest.x+8,(int)dest.y+9, uiFont(13), t.text);
             Rectangle pw{box.x+20,box.y+120,box.width-40,34}; DrawRectangleRec(pw,t.bg); DrawRectangleLinesEx(pw,1,s.focusedField==TextField::ArchivePassword?t.accent:t.line);
-            std::string mask(s.archive.password.size(), '*'); if(s.focusedField==TextField::ArchivePassword) drawInlineEditor(pw,mask.empty()?std::string{}:mask,s.editor,t,13); else DrawText(mask.empty()?"Password (optional)":mask.c_str(),(int)pw.x+8,(int)pw.y+9,13,mask.empty()?t.muted:t.text);
+            std::string mask(s.archive.password.size(), '*'); if(s.focusedField==TextField::ArchivePassword) drawInlineEditor(pw,mask.empty()?std::string{}:mask,s.editor,t,13); else DrawText(mask.empty()?"Password (optional)":mask.c_str(),(int)pw.x+8,(int)pw.y+9,uiFont(13),mask.empty()?t.muted:t.text);
             Rectangle ow{box.x+20,box.y+166,210,28};
-            DrawRectangleLinesEx(ow,1,t.line);
-            DrawText((std::string("Overwrite: ")+(s.archive.overwrite?"YES":"NO")).c_str(),(int)ow.x+8,(int)ow.y+7,13,t.text);
+            DrawRectangleLinesEx(ow, 1, t.line);
+            DrawText((std::string("Overwrite: ")+(s.archive.overwrite?"YES":"NO")).c_str(),(int)ow.x+8,(int)ow.y+7, uiFont(13), t.text);
             Rectangle apply{box.x+340,box.y+360,110,34},cancel{box.x+460,box.y+360,90,34};
-            DrawRectangleRec(apply,t.panel); DrawRectangleLinesEx(apply,1,t.accent); DrawText("Extract",(int)apply.x+29,(int)apply.y+10,13,t.text);
-            DrawRectangleRec(cancel,t.panel); DrawRectangleLinesEx(cancel,1,t.line); DrawText("Cancel",(int)cancel.x+22,(int)cancel.y+10,13,t.text);
-            DrawText("Enter = extract    Tab = next field    Esc = cancel",(int)box.x+20,(int)box.y+210,13,t.muted);
-            if(!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+246,12,Color{255,100,100,255});
+            DrawRectangleRec(apply,t.panel); DrawRectangleLinesEx(apply, 1, t.accent); DrawText("Extract",(int)apply.x+29,(int)apply.y+10, uiFont(13), t.text);
+            DrawRectangleRec(cancel,t.panel); DrawRectangleLinesEx(cancel, 1, t.line); DrawText("Cancel",(int)cancel.x+22,(int)cancel.y+10, uiFont(13), t.text);
+            DrawText("Enter = extract    Tab = next field    Esc = cancel",(int)box.x+20,(int)box.y+210, uiFont(13), t.muted);
+            if(!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+246, uiFont(12), Color{255,100,100,255});
             return;
         }
-        DrawText("Output",(int)box.x+20,(int)box.y+48,12,t.muted);
-        Rectangle out{box.x+20,box.y+62,box.width-40,34}; DrawRectangleRec(out,t.bg); DrawRectangleLinesEx(out,1,s.focusedField==TextField::ArchiveOutput?t.accent:t.line); if(s.focusedField==TextField::ArchiveOutput) drawInlineEditor(out,s.archive.output,s.editor,t,13); else DrawText(s.archive.output.c_str(),(int)out.x+8,(int)out.y+9,13,t.text);
+        DrawText("Output",(int)box.x+20,(int)box.y+48, uiFont(12), t.muted);
+        Rectangle out{box.x+20,box.y+62,box.width-40,34}; DrawRectangleRec(out,t.bg); DrawRectangleLinesEx(out,1,s.focusedField==TextField::ArchiveOutput?t.accent:t.line); if(s.focusedField==TextField::ArchiveOutput) drawInlineEditor(out,s.archive.output,s.editor,t,13); else DrawText(s.archive.output.c_str(),(int)out.x+8,(int)out.y+9, uiFont(13), t.text);
         const int x1=(int)box.x+20, x2=(int)box.x+305, yy=(int)box.y+114;
-        DrawText((std::string("Format: ") + archiveFormatName(s.archive.format)).c_str(),x1,yy,13,t.text);
-        DrawText((std::string("Compression: ") + compressionName(s.archive.compression)).c_str(),x2,yy,13,t.text);
-        DrawText(("Level: "+std::to_string(s.archive.level)).c_str(),x1,yy+30,13,t.text);
-        DrawText(("Threads: "+std::to_string(s.archive.threads)).c_str(),x2,yy+30,13,t.text);
-        DrawText(("Method: "+s.archive.sevenZipMethod).c_str(),x1,yy+60,13,t.text);
-        DrawText(("Encryption: "+std::string(archiveEncryptionLabel(s.archive))).c_str(),x2,yy+60,13,archivePasswordUIEnabled(s.archive)?t.text:t.muted);
+        DrawText((std::string("Format: ") + archiveFormatName(s.archive.format)).c_str(),x1,yy, uiFont(13), t.text);
+        DrawText((std::string("Compression: ") + compressionName(s.archive.compression)).c_str(),x2,yy, uiFont(13), t.text);
+        DrawText(("Level: "+std::to_string(s.archive.level)).c_str(),x1,yy+30, uiFont(13), t.text);
+        DrawText(("Threads: "+std::to_string(s.archive.threads)).c_str(),x2,yy+30, uiFont(13), t.text);
+        DrawText(("Method: "+s.archive.sevenZipMethod).c_str(),x1,yy+60, uiFont(13), t.text);
+        DrawText(("Encryption: "+std::string(archiveEncryptionLabel(s.archive))).c_str(),x2,yy+60,uiFont(13),archivePasswordUIEnabled(s.archive)?t.text:t.muted);
         const bool pwEnabled=archivePasswordUIEnabled(s.archive);
         Rectangle pw{x1*1.0f,box.y+236,box.width-40,34}; DrawRectangleRec(pw,pwEnabled?t.bg:t.panel); DrawRectangleLinesEx(pw,1,(pwEnabled&&s.focusedField==TextField::ArchivePassword)?t.accent:t.line);
         std::string mask(s.archive.password.size(), '*');
         if(pwEnabled && s.focusedField==TextField::ArchivePassword) {
             // Render the actual editable password buffer without exposing it.
             std::string stars(s.archive.password.size(),'*'); drawInlineEditor(pw,stars,s.editor,t,13);
-        } else DrawText((pwEnabled?(mask.empty()?"Password (optional)":mask):"Password unsupported by this format").c_str(),(int)pw.x+8,(int)pw.y+9,13,pwEnabled?(mask.empty()?t.muted:t.text):t.muted);
+        } else DrawText((pwEnabled?(mask.empty()?"Password (optional)":mask):"Password unsupported by this format").c_str(),(int)pw.x+8,(int)pw.y+9,uiFont(13),pwEnabled?(mask.empty()?t.muted:t.text):t.muted);
         const char* archiveHelp = (s.archive.format==ArchiveFormat::SevenZip) ? "7z password uses the system 7z/7zz tool; libarchive handles the archive data." : "Click a parameter or use LMB/RMB to cycle it. Format selects a template; every parameter remains editable.";
-        DrawText(archiveHelp,(int)box.x+20,(int)box.y+286,11,t.muted);
+        DrawText(archiveHelp,(int)box.x+20,(int)box.y+286, uiFont(11), t.muted);
         Rectangle apply{box.x+340,box.y+360,110,34},cancel{box.x+460,box.y+360,90,34};
-        DrawRectangleRec(apply,t.panel); DrawRectangleLinesEx(apply,1,t.accent); DrawText("Compress",(int)apply.x+21,(int)apply.y+10,13,t.text);
-        DrawRectangleRec(cancel,t.panel); DrawRectangleLinesEx(cancel,1,t.line); DrawText("Cancel",(int)cancel.x+22,(int)cancel.y+10,13,t.text);
-        DrawText("Tab = next field   Left/Right = cycle   Enter = compress   Esc = cancel",(int)box.x+20,(int)box.y+306,12,t.muted);
-        if(!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+334,12,Color{255,100,100,255});
+        DrawRectangleRec(apply,t.panel); DrawRectangleLinesEx(apply, 1, t.accent); DrawText("Compress",(int)apply.x+21,(int)apply.y+10, uiFont(13), t.text);
+        DrawRectangleRec(cancel,t.panel); DrawRectangleLinesEx(cancel, 1, t.line); DrawText("Cancel",(int)cancel.x+22,(int)cancel.y+10, uiFont(13), t.text);
+        DrawText("Tab = next field   Left/Right = cycle   Enter = compress   Esc = cancel",(int)box.x+20,(int)box.y+306, uiFont(12), t.muted);
+        if(!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+334, uiFont(12), Color{255,100,100,255});
         return;
     }
 
     if (s.modal==Modal::Cat) {
-        DrawText("cat text view mode",(int)box.x+20,(int)box.y+54,17,t.text);
+        DrawText("cat text view mode",(int)box.x+20,(int)box.y+54, uiFont(17), t.text);
         Rectangle view{box.x+18,box.y+72,box.width-36,box.height-110};
-        DrawRectangleRec(view,colorHex(0x020202)); DrawRectangleLinesEx(view,1,t.line);
+        DrawRectangleRec(view,colorHex(0x020202)); DrawRectangleLinesEx(view, 1, t.line);
         BeginScissorMode((int)view.x+1,(int)view.y+1,(int)view.width-2,(int)view.height-2);
         int y=(int)view.y+8;
         std::istringstream in(s.catText); std::string line; int n=0; const int lineH=16;
-        while(std::getline(in,line)){ if(n++<s.catScroll) continue; DrawText(line.c_str(),(int)view.x+8,y,12,t.text); y+=lineH; if(y>view.y+view.height-18) break; }
+        while(std::getline(in,line)){ if(n++<s.catScroll) continue; DrawText(line.c_str(),(int)view.x+8,y, uiFont(12), t.text); y+=lineH; if(y>view.y+view.height-18) break; }
         EndScissorMode();
-        DrawText("Up/Down/PageUp/PageDown or wheel = scroll    Esc = close",(int)box.x+20,(int)box.y+410,11,t.muted);
+        DrawText("Up/Down/PageUp/PageDown or wheel = scroll    Esc = close",(int)box.x+20,(int)box.y+410, uiFont(11), t.muted);
         return;
     }
 
 
     if (s.modal==Modal::DiskInfo) {
-        if(s.diskInfo.mounts.empty()){DrawText("No mounted filesystems",(int)box.x+20,(int)box.y+60,14,t.text);return;}
+        if(s.diskInfo.mounts.empty()){DrawText("No mounted filesystems",(int)box.x+20,(int)box.y+60, uiFont(14), t.text);return;}
         const int n=(int)s.diskInfo.mounts.size();
         const int tabLeft=(int)box.x+52, tabRight=(int)box.x+(int)box.width-52;
         const int tabAreaW=tabRight-tabLeft;
@@ -2571,8 +2667,8 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
         if(s.diskInfo.tab<s.diskInfo.firstTab) s.diskInfo.firstTab=s.diskInfo.tab;
         if(s.diskInfo.tab>=s.diskInfo.firstTab+visibleTabs) s.diskInfo.firstTab=s.diskInfo.tab-visibleTabs+1;
         Rectangle leftTab{box.x+20,box.y+18,26,28}, rightTab{box.x+box.width-46,box.y+18,26,28};
-        DrawRectangleRec(leftTab,t.panel); DrawRectangleLinesEx(leftTab,1,t.line); DrawText("<",(int)leftTab.x+8,(int)leftTab.y+6,14,t.text);
-        DrawRectangleRec(rightTab,t.panel); DrawRectangleLinesEx(rightTab,1,t.line); DrawText(">",(int)rightTab.x+8,(int)rightTab.y+6,14,t.text);
+        DrawRectangleRec(leftTab,t.panel); DrawRectangleLinesEx(leftTab, 1, t.line); DrawText("<",(int)leftTab.x+8,(int)leftTab.y+6, uiFont(14), t.text);
+        DrawRectangleRec(rightTab,t.panel); DrawRectangleLinesEx(rightTab, 1, t.line); DrawText(">",(int)rightTab.x+8,(int)rightTab.y+6, uiFont(14), t.text);
         BeginScissorMode(tabLeft,(int)box.y+16,tabAreaW,32);
         for(int slot=0;slot<visibleTabs && s.diskInfo.firstTab+slot<n;++slot){
             const int i=s.diskInfo.firstTab+slot;
@@ -2580,40 +2676,40 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
             DrawRectangleRec(tr,i==s.diskInfo.tab?t.panel:t.bg); DrawRectangleLinesEx(tr,1,i==s.diskInfo.tab?t.accent:t.line);
             std::string label=mountLabel(s.diskInfo.mounts[i]);
             if(label.size()>19) label=label.substr(0,16)+"...";
-            DrawText(label.c_str(),(int)tr.x+7,(int)tr.y+7,11,t.text);
+            DrawText(label.c_str(),(int)tr.x+7,(int)tr.y+7, uiFont(11), t.text);
         }
         EndScissorMode();
         const auto& d=s.diskInfo.mounts[std::clamp(s.diskInfo.tab,0,n-1)]; const int x=(int)box.x+20,y=(int)box.y+62;
-        DrawText(d.source.c_str(),x,y,14,t.text); DrawText(("Filesystem: "+d.fstype).c_str(),x,y+24,12,t.muted); DrawText(("Mount point: "+d.mountpoint.string()).c_str(),x,y+44,12,t.muted);
+        DrawText(d.source.c_str(),x,y, uiFont(14), t.text); DrawText(("Filesystem: "+d.fstype).c_str(),x,y+24, uiFont(12), t.muted); DrawText(("Mount point: "+d.mountpoint.string()).c_str(),x,y+44, uiFont(12), t.muted);
         const float ratio=d.total?std::clamp((float)((double)d.used/(double)d.total),0.0f,1.0f):0.0f; const Vector2 center{box.x+175,box.y+225};
-        DrawCircle(center.x,center.y,104,t.panel); if(ratio>0)DrawCircleSector(center,104,-90,-90+ratio*360.0f,96,t.accent); DrawCircle(center.x,center.y,65,t.bg);
-        DrawText(diskPercent(d).c_str(),(int)center.x-27,(int)center.y-10,18,t.text); DrawText("used",(int)center.x-16,(int)center.y+13,12,t.muted);
-        const int sx=(int)box.x+325,sy=(int)box.y+150; DrawText(("Total: "+formatBytes(d.total)).c_str(),sx,sy,14,t.text); DrawText(("Used:  "+formatBytes(d.used)).c_str(),sx,sy+32,14,t.text); DrawText(("Free:  "+formatBytes(d.free)).c_str(),sx,sy+64,14,t.text); DrawText(("Usage: "+diskPercent(d)).c_str(),sx,sy+96,14,t.text);
-        DrawText("Click a tab to inspect another mounted filesystem.",(int)box.x+20,(int)box.y+340,12,t.muted); Rectangle closeR{box.x+440,box.y+344,70,32}; DrawRectangleRec(closeR,t.panel); DrawRectangleLinesEx(closeR,1,t.line); DrawText("Close",(int)closeR.x+17,(int)closeR.y+9,13,t.text); return;
+        DrawCircle(center.x,center.y,104,t.panel); if(ratio>0)DrawCircleSector(center,104,-90,-90+ratio*360.0f, uiFont(96), t.accent); DrawCircle(center.x,center.y, uiFont(65), t.bg);
+        DrawText(diskPercent(d).c_str(),(int)center.x-27,(int)center.y-10, uiFont(18), t.text); DrawText("used",(int)center.x-16,(int)center.y+13, uiFont(12), t.muted);
+        const int sx=(int)box.x+325,sy=(int)box.y+150; DrawText(("Total: "+formatBytes(d.total)).c_str(),sx,sy, uiFont(14), t.text); DrawText(("Used:  "+formatBytes(d.used)).c_str(),sx,sy+32, uiFont(14), t.text); DrawText(("Free:  "+formatBytes(d.free)).c_str(),sx,sy+64, uiFont(14), t.text); DrawText(("Usage: "+diskPercent(d)).c_str(),sx,sy+96, uiFont(14), t.text);
+        DrawText("Click a tab to inspect another mounted filesystem.",(int)box.x+20,(int)box.y+340, uiFont(12), t.muted); Rectangle closeR{box.x+440,box.y+344,70,32}; DrawRectangleRec(closeR,t.panel); DrawRectangleLinesEx(closeR, 1, t.line); DrawText("Close",(int)closeR.x+17,(int)closeR.y+9, uiFont(13), t.text); return;
     }
 
     if (s.modal==Modal::Properties) {
         const fs::path p=s.props.path;
-        DrawText(p.filename().string().c_str(),(int)box.x+20,(int)box.y+54,18,t.text);
-        DrawText(p.string().c_str(),(int)box.x+20,(int)box.y+77,12,t.muted);
-        DrawText(("Type: "+safeMagicOneLine(s.props.magic.description)).c_str(),(int)box.x+20,(int)box.y+108,12,t.text);
-        DrawText(("MIME: "+s.props.magic.mime).c_str(),(int)box.x+20,(int)box.y+129,12,t.muted);
-        DrawText(("Size: "+formatBytes(s.props.totalSize)).c_str(),(int)box.x+20,(int)box.y+151,12,t.text);
-        DrawText(("Items: "+std::to_string(s.props.itemCount)).c_str(),(int)box.x+250,(int)box.y+151,12,t.muted);
-        DrawText("Permissions",(int)box.x+20,(int)box.y+178,15,t.text);
-        DrawText("Octal",(int)box.x+20,(int)box.y+204,12,t.muted);
-        Rectangle modeR{box.x+68,box.y+197,90,31}; DrawRectangleRec(modeR,t.bg); DrawRectangleLinesEx(modeR,1,s.focusedField==TextField::Mode?t.accent:t.line); DrawText(s.props.modeEdit.c_str(),(int)modeR.x+8,(int)modeR.y+7,14,t.text);
-        DrawText("User",(int)box.x+35,(int)box.y+248,12,t.muted); DrawText("Group",(int)box.x+205,(int)box.y+248,12,t.muted); DrawText("Other",(int)box.x+375,(int)box.y+248,12,t.muted);
+        DrawText(p.filename().string().c_str(),(int)box.x+20,(int)box.y+54, uiFont(18), t.text);
+        DrawText(p.string().c_str(),(int)box.x+20,(int)box.y+77, uiFont(12), t.muted);
+        DrawText(("Type: "+safeMagicOneLine(s.props.magic.description)).c_str(),(int)box.x+20,(int)box.y+108, uiFont(12), t.text);
+        DrawText(("MIME: "+s.props.magic.mime).c_str(),(int)box.x+20,(int)box.y+129, uiFont(12), t.muted);
+        DrawText(("Size: "+formatBytes(s.props.totalSize)).c_str(),(int)box.x+20,(int)box.y+151, uiFont(12), t.text);
+        DrawText(("Items: "+std::to_string(s.props.itemCount)).c_str(),(int)box.x+250,(int)box.y+151, uiFont(12), t.muted);
+        DrawText("Permissions",(int)box.x+20,(int)box.y+178, uiFont(15), t.text);
+        DrawText("Octal",(int)box.x+20,(int)box.y+204, uiFont(12), t.muted);
+        Rectangle modeR{box.x+68,box.y+197,90,31}; DrawRectangleRec(modeR,t.bg); DrawRectangleLinesEx(modeR,1,s.focusedField==TextField::Mode?t.accent:t.line); DrawText(s.props.modeEdit.c_str(),(int)modeR.x+8,(int)modeR.y+7, uiFont(14), t.text);
+        DrawText("User",(int)box.x+35,(int)box.y+248, uiFont(12), t.muted); DrawText("Group",(int)box.x+205,(int)box.y+248, uiFont(12), t.muted); DrawText("Other",(int)box.x+375,(int)box.y+248, uiFont(12), t.muted);
         static const char* labels[3] = {"R","W","X"};
         static const mode_t bits[3][3]={{S_IRUSR,S_IWUSR,S_IXUSR},{S_IRGRP,S_IWGRP,S_IXGRP},{S_IROTH,S_IWOTH,S_IXOTH}};
         for(int c=0;c<3;++c) for(int r=0;r<3;++r) {
             Rectangle cb{box.x+25+c*170+r*44,box.y+270,16,16}; drawCheckbox(cb,(s.props.mode&bits[c][r])!=0,labels[r],t.text,t.accent);
         }
-        DrawText("chmod is applied to the local filesystem item.",(int)box.x+20,(int)box.y+320,12,t.muted);
-        DrawText("Enter = edit octal field     Click Save to apply     Esc = cancel",(int)box.x+20,(int)box.y+350,13,t.text);
-        DrawRectangleRec({box.x+440,box.y+344,70,32},t.panel); DrawRectangleLinesEx({box.x+440,box.y+344,70,32},1,t.accent); DrawText("Save",(int)box.x+458,(int)box.y+353,13,t.text);
-        DrawRectangleRec({box.x+515,box.y+344,45,32},t.panel); DrawRectangleLinesEx({box.x+515,box.y+344,45,32},1,t.line); DrawText("Esc",(int)box.x+525,(int)box.y+353,12,t.text);
-        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+382,12,Color{255,100,100,255});
+        DrawText("chmod is applied to the local filesystem item.",(int)box.x+20,(int)box.y+320, uiFont(12), t.muted);
+        DrawText("Enter = edit octal field     Click Save to apply     Esc = cancel",(int)box.x+20,(int)box.y+350, uiFont(13), t.text);
+        DrawRectangleRec({box.x+440,box.y+344,70,32},t.panel); DrawRectangleLinesEx({box.x+440,box.y+344,70,32}, 1, t.accent); DrawText("Save",(int)box.x+458,(int)box.y+353, uiFont(13), t.text);
+        DrawRectangleRec({box.x+515,box.y+344,45,32},t.panel); DrawRectangleLinesEx({box.x+515,box.y+344,45,32}, 1, t.line); DrawText("Esc",(int)box.x+525,(int)box.y+353, uiFont(12), t.text);
+        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+382, uiFont(12), Color{255,100,100,255});
     }
 }
 
@@ -2625,12 +2721,12 @@ static void drawContextMenu(const ExplorerState& s, const Theme& t, int W,int H)
     const int infoH=info.empty()?0:36;
     const int menuW=300, menuH=(int)s.menu.actions.size()*itemH+10+infoH;
     int x=(int)s.menu.pos.x, y=(int)s.menu.pos.y; if(x+menuW>W-4)x=W-menuW-4;if(y+menuH>H-4)y=H-menuH-4;
-    Rectangle box{(float)x,(float)y,(float)menuW,(float)menuH}; DrawRectangleRec(box,t.panel2); DrawRectangleLinesEx(box,1,t.line);
+    Rectangle box{(float)x,(float)y,(float)menuW,(float)menuH}; DrawRectangleRec(box,t.panel2); DrawRectangleLinesEx(box, 1, t.line);
     const Vector2 mouse=GetMousePosition();
     for(int i=0;i<(int)s.menu.actions.size();++i){
         Rectangle r{(float)x+4,(float)y+5+i*itemH,(float)menuW-8,(float)itemH};
         if(pointIn(r,mouse)) DrawRectangleRounded(r,0.10f,4,Fade(t.accent,0.20f));
-        DrawText(menuLabel(s.menu.actions[i]).c_str(),x+14,y+11+i*itemH,13,t.text);
+        DrawText(menuLabel(s.menu.actions[i]).c_str(),x+14,y+11+i*itemH, uiFont(13), t.text);
     }
     const int csi = checksumSubmenuIndex(s.menu);
     if (csi >= 0) {
@@ -2640,15 +2736,15 @@ static void drawContextMenu(const ExplorerState& s, const Theme& t, int W,int H)
         const float subY=std::min(parentR.y, (float)H-subH-4.0f);
         Rectangle subR{subX, subY, subW, subH};
         if (pointIn(parentR, mouse) || pointIn(subR, mouse)) {
-            DrawRectangleRec(subR, t.panel2); DrawRectangleLinesEx(subR,1,t.line);
+            DrawRectangleRec(subR, t.panel2); DrawRectangleLinesEx(subR, 1, t.line);
             for (int j=0;j<5;++j) {
                 Rectangle sr{subR.x+4,subR.y+5+j*itemH,subR.width-8,(float)itemH};
                 if(pointIn(sr,mouse)) DrawRectangleRounded(sr,0.10f,4,Fade(t.accent,0.20f));
-                DrawText(checksumAlgorithmLabel(j), (int)sr.x+12, (int)sr.y+11, 13, t.text);
+                DrawText(checksumAlgorithmLabel(j), (int)sr.x+12, (int)sr.y+11, uiFont(13), t.text);
             }
         }
     }
-    if(!info.empty()){ const int yy=y+10+(int)s.menu.actions.size()*itemH; DrawLine(x+8,yy,x+menuW-8,yy,t.line); DrawText("Type:",x+14,yy+8,11,t.muted); DrawText(info.c_str(),x+48,yy+8,11,t.text); }
+    if(!info.empty()){ const int yy=y+10+(int)s.menu.actions.size()*itemH; DrawLine(x+8,yy,x+menuW-8,yy,t.line); DrawText("Type:",x+14,yy+8, uiFont(11), t.muted); DrawText(info.c_str(),x+48,yy+8, uiFont(11), t.text); }
 }
 
 
@@ -2987,6 +3083,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+    InitWindow(1360,780,"Win7RayExplorer / raymothfm");
+    SetExitKey(KEY_NULL);
+    SetTargetFPS(60);
+    BeginDrawing();
+    ClearBackground(BLACK);
+    DrawText("Starting raymothfm...", 24, 24, 20, WHITE);
+    DrawText("Initializing image/archive services...", 24, 54, 14, Color{170,170,170,255});
+    EndDrawing();
+
     if (vips_init("raymothfm") != 0) return 1;
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     // Thumbnail jobs run off the UI thread. Keep libvips worker width bounded to
@@ -2999,14 +3105,12 @@ int main(int argc, char** argv) {
     thumbnailWorker.start(hw >= 4 ? 2 : 1);
     gThumbnailWorker = &thumbnailWorker;
 
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
-    InitWindow(1360,780,"Win7RayExplorer / raymothfm");
-    SetExitKey(KEY_NULL);
-    SetTargetFPS(60);
     EnableEventWaiting();
 
     ExplorerState st;
     st.config=loadConfig();
+    st.config.fontScale = std::clamp(st.config.fontScale, 1.0f, 2.5f);
+    gUIFontScale = st.config.fontScale;
     st.config.accent = st.config.accent.a == 0 ? kThemes[st.config.theme].accent : st.config.accent;
 
     fs::path start=homeDir();
@@ -3032,7 +3136,7 @@ int main(int argc, char** argv) {
         if (isCtrlDown() && IsKeyPressed(KEY_Q)) break;
         if (IsKeyPressed(KEY_ESCAPE)) {
             if (st.menu.open) st.menu.open=false;
-            else if (st.modal!=Modal::None) { st.modal=Modal::None; st.modalError.clear(); unfocus(st); }
+            else if (st.modal!=Modal::None) { if (st.modal==Modal::ConfirmPermanentDelete) st.pendingPermanentDelete.clear(); st.modal=Modal::None; st.modalError.clear(); unfocus(st); }
             else if (st.focusedField!=TextField::None) unfocus(st);
         }
         const int W=GetScreenWidth(), H=GetScreenHeight();
@@ -3051,7 +3155,10 @@ int main(int argc, char** argv) {
             }
             if (IsKeyPressed(KEY_F1)) openHelp(st);
             if (IsKeyPressed(KEY_F4)) openAbout(st);
-            if (IsKeyPressed(KEY_F3)) { st.themeEdit=std::to_string(st.config.theme); st.modal=Modal::ThemePicker; focus(st,TextField::ThemeNumber,false); st.menu.open=false; }
+            if (IsKeyPressed(KEY_F3)) {
+    st.themeEdit=std::to_string(st.config.theme); st.editorEdit=st.config.editor; st.termEdit=st.config.term; st.accentEdit=hexRGB(st.config.accent); st.fontScaleEdit=std::to_string(st.config.fontScale);
+    st.modal=Modal::ThemePicker; focus(st,TextField::ThemeNumber,false); st.menu.open=false;
+}
             if (isCtrlDown() && IsKeyPressed(KEY_F)) focus(st,TextField::Search,true);
             if (isCtrlDown() && IsKeyPressed(KEY_L)) focus(st,TextField::Address,true);
             if (isCtrlDown() && IsKeyPressed(KEY_T)) newTab(st,st.path.empty()?homeDir():fs::path(st.path));
@@ -3067,6 +3174,12 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_F9) && st.focusedField==TextField::None) {
                 openCurrentDirectoryInTerminal(st);
             }
+            if (isCtrlDown() && IsKeyPressed(KEY_HOME) && st.focusedField==TextField::None) {
+                const fs::path hp = homeDir();
+                std::error_code ec;
+                if (st.vfs && st.vfs->isLocal() && fs::is_directory(hp, ec)) openLocalPath(st, hp);
+                else if (st.vfs && st.vfs->isLocal()) st.status = "Home directory unavailable";
+            }
             if (isAltDown() && IsKeyPressed(KEY_LEFT) && st.historyIndex>0) { --st.historyIndex; navigate(st,st.history[st.historyIndex],false); }
             if (isAltDown() && IsKeyPressed(KEY_RIGHT) && st.historyIndex+1<(int)st.history.size()) { ++st.historyIndex; navigate(st,st.history[st.historyIndex],false); }
             if (isAltDown() && IsKeyPressed(KEY_UP)) if (auto p=st.vfs->parent(st.path)) navigate(st,*p,true);
@@ -3079,8 +3192,9 @@ int main(int argc, char** argv) {
 
             }
             if (st.focusedField==TextField::None) {
-                if (keyRepeatPressed(KEY_UP)) moveSelection(st,-1,false);
-                if (keyRepeatPressed(KEY_DOWN)) moveSelection(st,1,false);
+                const int cols = gridColumns(st);
+                if (keyRepeatPressed(KEY_UP)) moveSelection(st, (st.view==ViewMode::MediumIcons || st.view==ViewMode::LargeIcons) ? -cols : -1, false);
+                if (keyRepeatPressed(KEY_DOWN)) moveSelection(st, (st.view==ViewMode::MediumIcons || st.view==ViewMode::LargeIcons) ? cols : 1, false);
                 if (keyRepeatPressed(KEY_LEFT)) moveSelection(st,-1,false);
                 if (keyRepeatPressed(KEY_RIGHT)) moveSelection(st,1,false);
                 if (keyRepeatPressed(KEY_PAGE_UP)) moveSelection(st,-1,true);
@@ -3100,12 +3214,13 @@ int main(int argc, char** argv) {
             if (isCtrlDown() && IsKeyPressed(KEY_C) && st.focusedField==TextField::None) doCopyOrCut(st,false);
             if (isCtrlDown() && IsKeyPressed(KEY_V) && st.focusedField==TextField::None) pasteClipboard(st);
             if (isCtrlDown() && IsKeyPressed(KEY_X) && st.focusedField==TextField::None) doCopyOrCut(st,true);
-            if (IsKeyPressed(KEY_DELETE) && st.focusedField==TextField::None) deleteSelection(st,isShiftDown());
+            if (IsKeyPressed(KEY_DELETE) && st.focusedField==TextField::None) { if (isShiftDown()) openPermanentDeleteConfirm(st); else deleteSelection(st,false); }
             if (IsKeyPressed(KEY_BACKSPACE) && st.focusedField==TextField::None) if (auto p=st.vfs->parent(st.path)) navigate(st,*p,true);
         }
 
         if (st.modal==Modal::CreateArchive || st.modal==Modal::ExtractArchive) processArchiveModalInput(st);
         if (st.modal==Modal::PasteOverwrite && IsKeyPressed(KEY_ENTER)) { finishPasteOne(st,st.pendingPasteSource,st.pendingPasteDestination,st.flags.pendingPasteCut,true); st.modal=Modal::None; unfocus(st); }
+        if (st.modal==Modal::ConfirmPermanentDelete && IsKeyPressed(KEY_ENTER)) applyPermanentDelete(st);
         if (st.modal==Modal::NewItem && IsKeyPressed(KEY_ENTER)) { createNewItem(st); }
         if (st.modal==Modal::ImageView) {
             if(IsKeyPressed(KEY_F)) st.flags.imageFit=!st.flags.imageFit;
@@ -3167,15 +3282,17 @@ int main(int argc, char** argv) {
                 }
                 if (IsKeyPressed(KEY_HOME)) { st.editor.cursor=0; if(!shift) st.editor.clear(); }
                 if (IsKeyPressed(KEY_END)) { st.editor.cursor=st.editor.text->size(); if(!shift) st.editor.clear(); }
-                if (isCtrlDown() && IsKeyPressed(KEY_BACKSPACE) && (st.focusedField==TextField::Address || st.focusedField==TextField::Command)) st.editor.backspaceToSlash();
-                else if (IsKeyPressed(KEY_BACKSPACE)) st.editor.backspace();
+                const bool backspaceRepeat = keyRepeatPressed(KEY_BACKSPACE, 0.22, 0.025);
+                if (isCtrlDown() && backspaceRepeat && (st.focusedField==TextField::Address || st.focusedField==TextField::Command)) st.editor.backspaceToSlash();
+                else if (backspaceRepeat) st.editor.backspace();
                 if (IsKeyPressed(KEY_DELETE)) st.editor.del();
                 int cp=GetCharPressed();
                 bool changed=false;
                 while(cp>0) { if(cp>=32 && cp!=127) { st.editor.replace(std::string(1,(char)cp)); changed=true; } cp=GetCharPressed(); }
-                if (changed || IsKeyPressed(KEY_BACKSPACE) || IsKeyPressed(KEY_DELETE) || (isCtrlDown() && (IsKeyPressed(KEY_V)||IsKeyPressed(KEY_X)))) resetCompletion(st);
-                if (st.focusedField==TextField::ArchiveOutput && (changed || IsKeyPressed(KEY_BACKSPACE) || IsKeyPressed(KEY_DELETE) || (isCtrlDown() && (IsKeyPressed(KEY_V)||IsKeyPressed(KEY_X)))) ) st.flags.archiveTemplateAuto=false;
+                if (changed || backspaceRepeat || IsKeyPressed(KEY_DELETE) || (isCtrlDown() && (IsKeyPressed(KEY_V)||IsKeyPressed(KEY_X)))) resetCompletion(st);
+                if (st.focusedField==TextField::ArchiveOutput && (changed || backspaceRepeat || IsKeyPressed(KEY_DELETE) || (isCtrlDown() && (IsKeyPressed(KEY_V)||IsKeyPressed(KEY_X)))) ) st.flags.archiveTemplateAuto=false;
                 if (st.focusedField==TextField::Search) updateFilter(st);
+                if (IsKeyPressed(KEY_ENTER) && st.modal==Modal::None && st.focusedField==TextField::Search) { unfocus(st); resetCompletion(st); }
                 if (IsKeyPressed(KEY_ENTER) && st.modal==Modal::None && st.focusedField==TextField::Address) {
                     fs::path p=st.addressEdit; std::error_code ec;
                     if (fs::is_directory(p,ec)) {
@@ -3224,31 +3341,31 @@ int main(int argc, char** argv) {
         ClearBackground(t.bg);
         DrawRectangle(0,0,W,top,t.panel2); DrawLine(0,top,W,top,t.line);
         // Tab strip
-        DrawRectangle(0,48,W,30,t.panel); DrawLine(0,78,W,78,t.line);
+        DrawRectangle(0,48,W, uiFont(30), t.panel); DrawLine(0,78,W, uiFont(78), t.line);
         const int tabW=170;
         for(int ti=0;ti<(int)st.tabs.size();++ti){
             Rectangle tr{(float)(8+ti*tabW),50,(float)tabW-4,26};
             const bool active=ti==st.activeTab;
             DrawRectangleRec(tr,active?t.panel2:t.panel);
-            if(active) DrawRectangleLinesEx(tr,1,t.accent); else DrawRectangleLinesEx(tr,1,t.line);
+            if(active) DrawRectangleLinesEx(tr, 1, t.accent); else DrawRectangleLinesEx(tr, 1, t.line);
             std::string title=tabTitle(st,ti); if(title.size()>20) title=title.substr(0,17)+"...";
-            DrawText(title.c_str(),(int)tr.x+10,(int)tr.y+7,12,t.text);
-            if(ti>0 || st.tabs.size()>1) DrawText("x",(int)tr.x+tabW-24,(int)tr.y+6,12,t.muted);
+            DrawText(title.c_str(),(int)tr.x+10,(int)tr.y+7, uiFont(12), t.text);
+            if(ti>0 || st.tabs.size()>1) DrawText("x",(int)tr.x+tabW-24,(int)tr.y+6, uiFont(12), t.muted);
         }
-        Rectangle plusR{(float)W-36.0f,51.0f,27.0f,24.0f}; DrawRectangleRec(plusR,t.panel); DrawRectangleLinesEx(plusR,1,t.line); DrawText("+",W-29,56,16,t.text);
+        Rectangle plusR{(float)W-36.0f,51.0f,27.0f,24.0f}; DrawRectangleRec(plusR,t.panel); DrawRectangleLinesEx(plusR, 1, t.line); DrawText("+",W-29, 56, uiFont(16), t.text);
         DrawRectangleRec(backR,t.panel); DrawRectangleRec(fwdR,t.panel); DrawRectangleRec(upR,t.panel);
-        DrawRectangleLinesEx(backR,1,t.line); DrawRectangleLinesEx(fwdR,1,t.line); DrawRectangleLinesEx(upR,1,t.line);
-        rayicons::Draw(rayicons::ArrowLeft,backR.x+9,backR.y+8,1,t.muted); rayicons::Draw(rayicons::ArrowRight,fwdR.x+9,fwdR.y+8,1,t.muted); rayicons::Draw(rayicons::ArrowUp,upR.x+9,upR.y+8,1,t.muted);
+        DrawRectangleLinesEx(backR, 1, t.line); DrawRectangleLinesEx(fwdR, 1, t.line); DrawRectangleLinesEx(upR, 1, t.line);
+        rayicons::Draw(rayicons::ArrowLeft,backR.x+9,backR.y+8, uiFont(1), t.muted); rayicons::Draw(rayicons::ArrowRight,fwdR.x+9,fwdR.y+8, uiFont(1), t.muted); rayicons::Draw(rayicons::ArrowUp,upR.x+9,upR.y+8, uiFont(1), t.muted);
 
         DrawRectangleRec(addrR,t.bg); DrawRectangleLinesEx(addrR,1,st.focusedField==TextField::Address?t.accent:t.line);
-        if (st.focusedField==TextField::Address) drawInlineEditor(addrR,st.addressEdit,st.editor,t,14); else DrawText(st.addressEdit.c_str(),(int)addrR.x+10,17,14,t.text);
+        if (st.focusedField==TextField::Address) drawInlineEditor(addrR,st.addressEdit,st.editor,t,14); else DrawText(st.addressEdit.c_str(),(int)addrR.x+10, 17, uiFont(14), t.text);
         DrawRectangleRec(searchR,t.bg); DrawRectangleLinesEx(searchR,1,st.focusedField==TextField::Search?t.accent:t.line);
-        if(st.focusedField==TextField::Search) { if(st.searchEdit.empty()) DrawText("Search",(int)searchR.x+10,17,14,t.muted); drawInlineEditor(searchR,st.searchEdit,st.editor,t,14); }
-        else DrawText(st.searchEdit.empty()?"Search":st.searchEdit.c_str(),(int)searchR.x+10,17,14,st.searchEdit.empty()?t.muted:t.text);
+        if(st.focusedField==TextField::Search) { if(st.searchEdit.empty()) DrawText("Search",(int)searchR.x+10, 17, uiFont(14), t.muted); drawInlineEditor(searchR,st.searchEdit,st.editor,t,14); }
+        else DrawText(st.searchEdit.empty()?"Search":st.searchEdit.c_str(),(int)searchR.x+10,17,uiFont(14),st.searchEdit.empty()?t.muted:t.text);
 
         if (st.flags.sidebar) {
             DrawRectangle(0,top,left,contentH,t.panel); DrawLine(left,top,left,H-statusH,t.line);
-            DrawText("Favorites",15,top+17,15,t.accent);
+            DrawText("Favorites", 15, top+17, uiFont(15), t.accent);
             int fy=top+45;
             for (size_t i=0;i<st.config.favorites.size();++i) {
                 const fs::path fp=st.config.favorites[i]; const std::string label=fp.filename().empty()?fp.string():fp.filename().string();
@@ -3256,14 +3373,14 @@ int main(int argc, char** argv) {
                 if (pointIn(fr,mouse)) DrawRectangleRec(fr,t.hover);
                 rayicons::Draw(rayicons::FolderOpen,18,fy,1,(t.bg.r>240&&t.bg.g>240&&t.bg.b>240)?t.text:t.accent);
                 std::string shown=label; if (shown.size()>25) shown=shown.substr(0,22)+"...";
-                DrawText(shown.c_str(),42,fy+3,14,t.text); fy+=29;
+                DrawText(shown.c_str(), 42, fy+3, uiFont(14), t.text); fy+=29;
             }
-            DrawText("Computer",15,fy+13,15,t.accent); fy+=40;
+            DrawText("Computer", 15, fy+13, uiFont(15), t.accent); fy+=40;
             auto drawNavRow = [&](const char* label, const fs::path& target, rayicons::Icon icon)->Rectangle {
                 Rectangle r{8.0f,(float)fy-5,left-16.0f,28};
                 if(pointIn(r,mouse)) DrawRectangleRec(r,t.hover);
                 rayicons::Draw(icon,18,fy,1,(t.bg.r>240&&t.bg.g>240&&t.bg.b>240)?t.text:t.accent);
-                DrawText(label,42,fy+3,14,t.text);
+                DrawText(label, 42, fy+3, uiFont(14), t.text);
                 fy+=29;
                 return r;
             };
@@ -3272,14 +3389,14 @@ int main(int argc, char** argv) {
             Rectangle rootR = drawNavRow("File System", fs::path("/"), rayicons::FolderOpen);
             Rectangle tmpR = drawNavRow("tmpfs (/tmp)", fs::path("/tmp"), rayicons::FolderOpen);
             (void)homeR; (void)rootR; (void)tmpR;
-            DrawText("Disk",15,fy+13,15,t.accent); fy+=40; Rectangle diskR = drawNavRow("Disk usage", fs::path("/"), rayicons::FolderOpen); (void)diskR;
-            DrawText("XDG",15,fy+13,15,t.accent); fy+=40;
+            DrawText("Disk", 15, fy+13, uiFont(15), t.accent); fy+=40; Rectangle diskR = drawNavRow("Disk usage", fs::path("/"), rayicons::FolderOpen); (void)diskR;
+            DrawText("XDG", 15, fy+13, uiFont(15), t.accent); fy+=40;
             const fs::path dataHome=xdgDataHome();
             const fs::path configHome=configBase();
             const fs::path trashHome=xdgTrashHome();
             Rectangle trashR=drawNavRow("Trash", trashHome / "files", rayicons::FolderOpen);
-            Rectangle dataR=drawNavRow("XDG_DATA_HOME", dataHome, rayicons::FolderOpen);
-            Rectangle cfgR=drawNavRow("XDG_CONFIG_HOME", configHome, rayicons::FolderOpen);
+            Rectangle dataR=drawNavRow("Data", dataHome, rayicons::FolderOpen);
+            Rectangle cfgR=drawNavRow("Config", configHome, rayicons::FolderOpen);
             (void)trashR; (void)dataR; (void)cfgR;
         }
 
@@ -3287,12 +3404,12 @@ int main(int argc, char** argv) {
         DrawRectangle(left,top,W-left,headerH,t.panel); DrawLine(left,top+headerH,W,top+headerH,t.line);
         if (st.view==ViewMode::Details) {
             const char* arrows[4]={"", "", "", ""}; (void)arrows;
-            DrawText((std::string("Name ")+(st.sortKey==SortKey::Name?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+42,top+11,13,t.muted);
-            DrawText((std::string("Date modified ")+(st.sortKey==SortKey::Date?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+500,top+11,13,t.muted);
-            DrawText((std::string("Type ")+(st.sortKey==SortKey::Type?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+700,top+11,13,t.muted);
-            DrawText((std::string("Size ")+(st.sortKey==SortKey::Size?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+770,top+11,13,t.muted);
+            DrawText((std::string("Name ")+(st.sortKey==SortKey::Name?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+42,top+11, uiFont(13), t.muted);
+            DrawText((std::string("Date modified ")+(st.sortKey==SortKey::Date?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+500,top+11, uiFont(13), t.muted);
+            DrawText((std::string("Type ")+(st.sortKey==SortKey::Type?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+700,top+11, uiFont(13), t.muted);
+            DrawText((std::string("Size ")+(st.sortKey==SortKey::Size?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+770,top+11, uiFont(13), t.muted);
         }
-        else DrawText(st.vfs?st.vfs->displayPath().c_str():st.path.c_str(),left+14,top+11,13,t.muted);
+        else DrawText(st.vfs?st.vfs->displayPath().c_str():st.path.c_str(),left+14,top+11, uiFont(13), t.muted);
 
         int hoverRow=-1;
         st.thumbnailProtected.clear();
@@ -3305,7 +3422,7 @@ int main(int argc, char** argv) {
                 if(st.selection.count(idx)) DrawRectangleRec(rr,Fade(t.accent,0.25f)); else if(pointIn(rr,mouse)) DrawRectangleRec(rr,t.hover);
                 drawEntryIcon(e,left+12,(int)rr.y+(rowH-16)/2,16,entryIconColor(e,t));
                 DrawText(e.name.c_str(),left+42,(int)rr.y+9,st.view==ViewMode::Details?14:15,t.text);
-                if(st.view==ViewMode::Details){ DrawText(formatTime(e.mtime).c_str(),left+500,(int)rr.y+9,13,t.muted); DrawText(typeLabel(e).c_str(),left+700,(int)rr.y+9,13,t.muted); if(e.kind!=EntryKind::Directory) DrawText(formatBytes(e.size).c_str(),left+770,(int)rr.y+9,13,t.muted); }
+                if(st.view==ViewMode::Details){ DrawText(formatTime(e.mtime).c_str(),left+500,(int)rr.y+9, uiFont(13), t.muted); DrawText(typeLabel(e).c_str(),left+700,(int)rr.y+9, uiFont(13), t.muted); if(e.kind!=EntryKind::Directory) DrawText(formatBytes(e.size).c_str(),left+770,(int)rr.y+9, uiFont(13), t.muted); }
             }
         } else {
             const int cellW=st.view==ViewMode::MediumIcons?135:180, cellH=st.view==ViewMode::MediumIcons?110:150;
@@ -3317,7 +3434,7 @@ int main(int argc, char** argv) {
                 Rectangle rr{(float)x,(float)y,(float)cellW-7,(float)cellH-7};
                 if(pointIn(rr,mouse)){hoverRow=idx;}
                 if(st.selection.count(idx)) DrawRectangleRounded(rr,0.06f,6,Fade(t.accent,0.25f));
-                else if(pointIn(rr,mouse)) DrawRectangleRounded(rr,0.06f,6,t.hover);
+                else if(pointIn(rr,mouse)) DrawRectangleRounded(rr,0.06f, uiFont(6), t.hover);
                 const int icon=st.view==ViewMode::MediumIcons?48:80;
                 Texture2D thumb{};
                 if(st.config.showThumbnails && st.rows[idx].kind==EntryKind::File && isImagePath(st.rows[idx].name)) {
@@ -3326,18 +3443,18 @@ int main(int argc, char** argv) {
                 }
                 if(st.config.showThumbnails && ensureThumbnail(st,st.rows[idx],configuredThumbnailSize(st.config),thumb)){
                     Rectangle td{(float)(x+(rr.width-icon)/2),(float)(y+8),(float)icon,(float)icon};
-                    DrawTexturePro(thumb,{0,0,(float)thumb.width,(float)thumb.height},td,{0,0},0,WHITE);
+                    DrawTexturePro(thumb,{0,0,(float)thumb.width,(float)thumb.height},td,{0,0}, uiFont(0), WHITE);
                 } else drawEntryIcon(st.rows[idx],x+(int)((rr.width-icon)/2),y+8,icon,entryIconColor(st.rows[idx],t));
                 std::string label=st.rows[idx].name; const int maxTextW=(int)rr.width-10;
-                while(label.size()>3 && MeasureText(label.c_str(),13)>maxTextW) label=label.substr(0,label.size()-2);
+                while(label.size()>3 && MeasureText(label.c_str(),uiFont(13))>maxTextW) label=label.substr(0,label.size()-2);
                 if(label!=st.rows[idx].name && label.size()>=3) label=label.substr(0,label.size()-2)+"..";
-                int tw=MeasureText(label.c_str(),13); int tx=x+std::max(4,((int)rr.width-tw)/2);
-                DrawText(label.c_str(),tx,y+icon+16,13,t.text);
+                int tw=MeasureText(label.c_str(),uiFont(13)); int tx=x+std::max(4,((int)rr.width-tw)/2);
+                DrawText(label.c_str(),tx,y+icon+16, uiFont(13), t.text);
             }
         }
 
         // Status bar
-        DrawRectangle(0,H-statusH,W,statusH,t.panel2); DrawLine(0,H-statusH,W,H-statusH,t.line); DrawText(st.status.c_str(),10,H-statusH+8,13,t.muted);
+        DrawRectangle(0,H-statusH,W,statusH,t.panel2); DrawLine(0,H-statusH,W,H-statusH,t.line); DrawText(st.status.c_str(), 10, H-statusH+8, uiFont(13), t.muted);
 
         if(st.menu.open)drawContextMenu(st,t,W,H);
         if(st.modal!=Modal::None)drawModal(st,W,H,t);
@@ -3397,7 +3514,7 @@ int main(int argc, char** argv) {
                                     case MenuAction::Cut:doCopyOrCut(st,true);break;
                                     case MenuAction::Paste:pasteClipboard(st);break;
                                     case MenuAction::Delete:deleteSelection(st,false);break;
-                                    case MenuAction::PermanentDelete:deleteSelection(st,true);break;
+                                    case MenuAction::PermanentDelete:openPermanentDeleteConfirm(st);break;
                                     case MenuAction::Compress:openCreateArchive(st);break;
                                     case MenuAction::Extract:openExtractArchive(st);break;
                                     case MenuAction::OpenEditor:openInEditor(st);break;
@@ -3465,16 +3582,20 @@ int main(int argc, char** argv) {
 
         if(st.modal==Modal::ThemePicker && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             Rectangle box{W*0.5f-290,H*0.5f-220,580,440};
-            Rectangle field{box.x+20,box.y+82,170,36};
-            if(pointIn(field,mouse)) focusAt(st,TextField::ThemeNumber,mouse.x,field.x+8,15);
-            int yy=(int)box.y+140;
-            for(int i=0;i<(int)kThemes.size();++i){ Rectangle r{box.x+20,(float)yy-3,320,18}; if(pointIn(r,mouse)){ st.themeEdit=std::to_string(i); focus(st,TextField::ThemeNumber,true); } yy+=20; }
-        }
-        if(st.modal==Modal::ThemePicker && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            Rectangle box{W*0.5f-290,H*0.5f-220,580,440};
+            Rectangle themeF{box.x+20,box.y+92,150,34}, editorF{box.x+20,box.y+152,270,34}, termF{box.x+20,box.y+212,270,34}, fontF{box.x+20,box.y+272,170,34}, accentF{box.x+200,box.y+272,170,34}, hsvBtn{box.x+380,box.y+272,62,34};
             Rectangle apply{box.x+390,box.y+360,85,32}, cancel{box.x+485,box.y+360,65,32};
-            if(pointIn(apply,mouse)){ const int n=std::atoi(st.themeEdit.c_str()); if(n>=0&&n<(int)kThemes.size()){ st.config.theme=n; if(!st.config.accentCustom) st.config.accent=kThemes[n].accent; st.flags.configDirty=true; st.modal=Modal::None; unfocus(st);} }
-            if(pointIn(cancel,mouse)){ st.modal=Modal::None; unfocus(st); }
+            if(pointIn(themeF,mouse)) focusAt(st,TextField::ThemeNumber,mouse.x,themeF.x+8,13);
+            else if(pointIn(editorF,mouse)) focusAt(st,TextField::EditorConfig,mouse.x,editorF.x+8,13);
+            else if(pointIn(termF,mouse)) focusAt(st,TextField::TermConfig,mouse.x,termF.x+8,13);
+            else if(pointIn(fontF,mouse)) focusAt(st,TextField::FontScale,mouse.x,fontF.x+8,13);
+            else if(pointIn(accentF,mouse)) focusAt(st,TextField::AccentConfig,mouse.x,accentF.x+8,13);
+            else if(pointIn(hsvBtn,mouse)){ st.config.accent=ColorFromHSV(std::fmod((float)(GetTime()*53.0),360.0f),0.72f,0.96f); st.config.accentCustom=true; st.accentEdit=hexRGB(st.config.accent); st.flags.configDirty=true; }
+            else if(pointIn(apply,mouse)) {
+                int n=std::atoi(st.themeEdit.c_str()); if(n>=0&&n<(int)kThemes.size()) st.config.theme=n;
+                st.config.editor=st.editorEdit; st.config.term=st.termEdit; st.config.fontScale=std::clamp(std::strtof(st.fontScaleEdit.c_str(),nullptr),1.0f,2.5f); gUIFontScale=st.config.fontScale;
+                st.config.accent=accentFromHSVField(st.accentEdit, st.config.accent); st.config.accentCustom=true; st.flags.configDirty=true; st.modal=Modal::None; unfocus(st);
+            } else if(pointIn(cancel,mouse)){ st.modal=Modal::None; unfocus(st); }
+            else { int yy=(int)box.y+100; for(int i=0;i<(int)kThemes.size();++i){ Rectangle r{box.x+330,(float)yy-3,230,18}; if(pointIn(r,mouse)){ st.themeEdit=std::to_string(i); st.config.theme=i; if(!st.config.accentCustom) st.config.accent=kThemes[i].accent; st.flags.configDirty=true; } yy+=17; } }
         }
         if(st.modal==Modal::DiskInfo && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
             Rectangle box{W*0.5f-290,H*0.5f-220,580,440}; const int n=(int)st.diskInfo.mounts.size();
@@ -3497,6 +3618,12 @@ int main(int argc, char** argv) {
             Rectangle closeR{box.x+440,box.y+344,90,32};
             if(pointIn(hashR,mouse) && st.checksumValue.rfind("ERROR:",0) != 0 && st.checksumValue != "Calculating...") { SetClipboardText(st.checksumValue.c_str()); st.status="Checksum copied to clipboard"; }
             else if(pointIn(closeR,mouse)){ st.modal=Modal::None; unfocus(st); }
+        }
+        if(st.modal==Modal::ConfirmPermanentDelete && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
+            Rectangle box{W*0.5f-290,H*0.5f-220,580,440};
+            Rectangle apply{box.x+350,box.y+180,110,34}, cancel{box.x+470,box.y+180,70,34};
+            if(pointIn(apply,mouse)) applyPermanentDelete(st);
+            else if(pointIn(cancel,mouse)){ st.pendingPermanentDelete.clear(); st.modal=Modal::None; unfocus(st); }
         }
         if(st.modal==Modal::PasteOverwrite && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
             Rectangle box{W*0.5f-290,H*0.5f-220,580,440}; Rectangle apply{box.x+360,box.y+180,100,32}, cancel{box.x+470,box.y+180,70,32};
