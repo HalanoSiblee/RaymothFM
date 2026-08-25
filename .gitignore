@@ -57,5 +57,5 @@ vcpkg_installed/
 *.dwo
 
 # test output & cache
-hive/
+#hive/
 code/raymothfm
