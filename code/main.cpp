@@ -1443,7 +1443,7 @@ static bool isElfFile(const fs::path& p) {
     return in.gcount() == 4 && magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
 }
 
-static bool executeElfDetached(const fs::path& p) {
+static bool executeElfDetached(const fs::path& p, const fs::path& workingDir) {
     if (p.empty() || access(p.c_str(), X_OK) != 0) return false;
     pid_t leader = fork();
     if (leader < 0) return false;
@@ -1452,6 +1452,7 @@ static bool executeElfDetached(const fs::path& p) {
         pid_t child = fork();
         if (child < 0) _exit(126);
         if (child > 0) _exit(0);
+        if (!workingDir.empty() && chdir(workingDir.c_str()) != 0) _exit(126);
         execl(p.c_str(), p.c_str(), (char*)nullptr);
         _exit(127);
     }
@@ -1460,9 +1461,9 @@ static bool executeElfDetached(const fs::path& p) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-static void openExternal(const fs::path& p) {
+static void openExternal(const fs::path& p, const fs::path& workingDir) {
     if (p.empty()) return;
-    if (isElfFile(p) && executeElfDetached(p)) return;
+    if (isElfFile(p) && executeElfDetached(p, workingDir)) return;
 
     // xdg-open is asynchronous from the user's point of view, but leaving
     // the child unreaped creates a zombie for every opened file. Use the
@@ -1547,7 +1548,7 @@ static void extractSingleCompressionFile(ExplorerState& s, const fs::path& p, bo
     if (!extractSingleCompressionCli(p, out, error)) { s.status = error; return; }
     s.status = "Extracted: " + out.filename().string();
     refresh(s);
-    if (openResult) openExternal(out);
+    if (openResult) openExternal(out, s.path);
 }
 
 static void openSelected(ExplorerState& s) {
@@ -1556,7 +1557,7 @@ static void openSelected(ExplorerState& s) {
     if (e.kind == EntryKind::Directory) navigate(s,e.path,true);
     else if (e.kind == EntryKind::Archive && isSingleCompressionFile(e.path)) extractSingleCompressionFile(s,e.path,true);
     else if (e.kind == EntryKind::Archive) openArchive(s,e.path);
-    else { openExternal(e.path); s.status = "Opening " + e.name; }
+    else { openExternal(e.path, s.path); s.status = "Opening " + e.name; }
 }
 
 static std::string typeLabel(const VfsEntry& e) {
