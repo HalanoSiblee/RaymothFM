@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <cctype>
@@ -628,6 +629,9 @@ struct PropertiesState {
     std::string modeEdit = "0644";
     std::uintmax_t totalSize = 0;
     std::uint64_t itemCount = 0;
+    std::uint64_t selectedCount = 1;
+    bool multi = false;
+    std::time_t mtime = 0;
     TextEditor editor;
     int field = -1;
 };
@@ -748,6 +752,7 @@ struct ExplorerState {
     fs::path pendingPasteSource;
     fs::path pendingPasteDestination;
     std::vector<fs::path> pendingPermanentDelete;
+    size_t pendingPasteIndex = 0;
     std::string convertInput;
     std::string convertOutput;
     std::vector<std::string> convertFormats;
@@ -756,6 +761,12 @@ struct ExplorerState {
     int convertEffort = 5;
     int convertCompression = 6;
     int convertBitDepth = 8;
+    bool selectionDragging = false;
+    bool selectionDragMoved = false;
+    bool selectionDragAdditive = false;
+    Vector2 selectionDragStart{0,0};
+    Vector2 selectionDragCurrent{0,0};
+    std::set<int> selectionDragBase;
 };
 
 static void unfocus(ExplorerState& s);
@@ -1322,6 +1333,14 @@ static void moveSelection(ExplorerState& s, int delta, bool page=false) {
 static void openHelp(ExplorerState& s) { s.modal=Modal::Help; s.menu.open=false; unfocus(s); }
 static void openAbout(ExplorerState& s) { s.modal=Modal::About; s.menu.open=false; unfocus(s); }
 
+static std::string currentDisplayPath(const ExplorerState& s) {
+    // LocalVfs owns the provider instance created for a directory, so its displayPath()
+    // can become stale after navigating within that provider. The Explorer's current
+    // path is authoritative for local filesystems; archive providers need their own
+    // display path because they carry the virtual archive location.
+    return (s.vfs && !s.vfs->isLocal()) ? s.vfs->displayPath() : s.path;
+}
+
 static void navigate(ExplorerState& s, std::string p, bool pushHistory = true) {
     if (!s.vfs || !s.vfs->isDirectory(p)) return;
     if (pushHistory) {
@@ -1381,13 +1400,85 @@ static void selectAll(ExplorerState& s) {
     if (!s.visibleIndices.empty()) { s.selected=s.visibleIndices.front(); s.anchorSelection=s.selected; }
 }
 
+static Rectangle normalizedRect(Vector2 a, Vector2 b) {
+    const float x=std::min(a.x,b.x), y=std::min(a.y,b.y);
+    return {x,y,std::fabs(b.x-a.x),std::fabs(b.y-a.y)};
+}
+
+static bool rectsOverlap(Rectangle a, Rectangle b) {
+    return a.x < b.x+b.width && a.x+a.width > b.x && a.y < b.y+b.height && a.y+a.height > b.y;
+}
+
+static void updateDragSelection(ExplorerState& s, int left, int top, int contentH, int W) {
+    const Rectangle drag=normalizedRect(s.selectionDragStart,s.selectionDragCurrent);
+    s.selection=s.selectionDragAdditive?s.selectionDragBase:std::set<int>{};
+    const int headerH=34;
+    if(s.view==ViewMode::Details || s.view==ViewMode::List){
+        const int rowH=s.view==ViewMode::Details?34:30;
+        const int visible=std::max(1,(contentH-headerH)/rowH);
+        for(int i=0;i<visible && s.scroll+i<(int)s.visibleIndices.size();++i){
+            const int idx=s.visibleIndices[s.scroll+i];
+            Rectangle rr{(float)left,(float)(top+headerH+i*rowH),(float)(W-left-1),(float)rowH};
+            if(rectsOverlap(drag,rr)) s.selection.insert(idx);
+        }
+    }else{
+        const int cellW=s.view==ViewMode::MediumIcons?135:180, cellH=s.view==ViewMode::MediumIcons?110:150;
+        const int cols=std::max(1,(W-left-10)/cellW), rowsVisible=std::max(1,(contentH-34)/cellH);
+        for(int r=0;r<rowsVisible;++r) for(int c=0;c<cols;++c){
+            const int pos=(s.scroll+r)*cols+c; if(pos>=(int)s.visibleIndices.size()) break;
+            const int idx=s.visibleIndices[pos];
+            Rectangle rr{(float)(left+7+c*cellW),(float)(top+34+r*cellH),(float)cellW-7,(float)cellH-7};
+            if(rectsOverlap(drag,rr)) s.selection.insert(idx);
+        }
+    }
+    if(!s.selection.empty()) s.selected=*s.selection.rbegin();
+}
+
+static bool isElfFile(const fs::path& p) {
+    std::error_code ec;
+    if (!fs::is_regular_file(p, ec) || ec) return false;
+    std::ifstream in(p, std::ios::binary);
+    unsigned char magic[4]{};
+    in.read(reinterpret_cast<char*>(magic), 4);
+    return in.gcount() == 4 && magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
+}
+
+static bool executeElfDetached(const fs::path& p) {
+    if (p.empty() || access(p.c_str(), X_OK) != 0) return false;
+    pid_t leader = fork();
+    if (leader < 0) return false;
+    if (leader == 0) {
+        if (setsid() < 0) _exit(126);
+        pid_t child = fork();
+        if (child < 0) _exit(126);
+        if (child > 0) _exit(0);
+        execl(p.c_str(), p.c_str(), (char*)nullptr);
+        _exit(127);
+    }
+    int status = 0;
+    (void)waitpid(leader, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 static void openExternal(const fs::path& p) {
     if (p.empty()) return;
-    pid_t pid = fork();
-    if (pid == 0) {
+    if (isElfFile(p) && executeElfDetached(p)) return;
+
+    // xdg-open is asynchronous from the user's point of view, but leaving
+    // the child unreaped creates a zombie for every opened file. Use the
+    // same short-lived-session-leader pattern as terminal/editor launching.
+    pid_t leader = fork();
+    if (leader < 0) return;
+    if (leader == 0) {
+        if (setsid() < 0) _exit(126);
+        pid_t child = fork();
+        if (child < 0) _exit(126);
+        if (child > 0) _exit(0);
         execlp("xdg-open", "xdg-open", p.c_str(), (char*)nullptr);
         _exit(127);
     }
+    int status = 0;
+    (void)waitpid(leader, &status, 0);
 }
 
 static bool hasSuffix(const std::string& value, const char* suffix) {
@@ -1398,7 +1489,8 @@ static bool hasSuffix(const std::string& value, const char* suffix) {
 static bool isSingleCompressionFile(const fs::path& p) {
     const std::string n = lowerCopy(p.filename().string());
     return (n.size() > 3 && hasSuffix(n, ".gz") && !hasSuffix(n, ".tar.gz") && !hasSuffix(n, ".tgz")) ||
-           (n.size() > 4 && hasSuffix(n, ".zst") && !hasSuffix(n, ".tar.zst") && !hasSuffix(n, ".tzst"));
+           (n.size() > 4 && hasSuffix(n, ".zst") && !hasSuffix(n, ".tar.zst") && !hasSuffix(n, ".tzst")) ||
+           (n.size() > 3 && hasSuffix(n, ".xz") && !hasSuffix(n, ".tar.xz") && !hasSuffix(n, ".txz"));
 }
 
 static fs::path singleCompressionOutputPath(const fs::path& p) {
@@ -1409,6 +1501,7 @@ static fs::path singleCompressionOutputPath(const fs::path& p) {
         if (low.size() >= len && low.compare(low.size()-len, len, suffix) == 0) n.resize(n.size()-len);
     };
     if (hasSuffix(low, ".zst")) strip(".zst");
+    else if (hasSuffix(low, ".xz")) strip(".xz");
     else if (hasSuffix(low, ".gz")) strip(".gz");
     if (n.empty()) n = "extracted";
     return p.parent_path() / n;
@@ -1418,7 +1511,8 @@ static bool extractSingleCompressionCli(const fs::path& input, const fs::path& o
     const std::string low = lowerCopy(input.filename().string());
     const bool isGzip = hasSuffix(low, ".gz");
     const bool isZstd = hasSuffix(low, ".zst");
-    const char* tool = isGzip ? "gzip" : (isZstd ? "zstd" : nullptr);
+    const bool isXz = hasSuffix(low, ".xz");
+    const char* tool = isGzip ? "gzip" : (isZstd ? "zstd" : (isXz ? "xz" : nullptr));
     if (!tool) { error = "Unsupported single-file compression"; return false; }
     if (!commandExists(tool)) { error = std::string("Cannot find ") + tool + " for " + input.filename().string(); return false; }
     if (fs::exists(output)) {
@@ -1619,7 +1713,7 @@ private:
                         result.height = vips_image_get_height(rgba);
                         result.pixels.assign((unsigned char*)mem, (unsigned char*)mem + bytes);
                         result.ok = !result.pixels.empty();
-                        vips_free(mem);
+                        g_free(mem);
                     }
                 }
                 if (rgba) g_object_unref(rgba);
@@ -1842,32 +1936,75 @@ static void doCopyOrCut(ExplorerState& s, bool cut) {
     s.status = cut ? "Cut " + std::to_string(s.clipboard.paths.size()) + " item(s)" : "Copied " + std::to_string(s.clipboard.paths.size()) + " item(s)";
 }
 
-static void finishPasteOne(ExplorerState& s, const fs::path& src, const fs::path& dst, bool cut, bool overwrite) {
+static bool finishPasteOne(ExplorerState& s, const fs::path& src, const fs::path& dst, bool cut, bool overwrite) {
     std::string error;
     if (cut) {
         std::error_code ec;
-        if (overwrite && fs::exists(dst,ec)) fs::remove_all(dst,ec);
-        fs::rename(src,dst,ec);
-        if (ec) { if (!copyRecursive(src,dst,error) || !removeRecursive(src,error)) { s.status="Paste failed: "+error; return; } }
+        if (overwrite && fs::exists(dst, ec)) {
+            fs::remove_all(dst, ec);
+            if (ec) { s.status = "Paste failed: " + ec.message(); return false; }
+        }
+        fs::rename(src, dst, ec);
+        if (ec) {
+            if (!copyRecursive(src, dst, error) || !removeRecursive(src, error)) {
+                s.status = "Paste failed: " + error;
+                return false;
+            }
+        }
     } else {
-        if (overwrite && fs::exists(dst)) fs::remove_all(dst);
-        if (!copyRecursive(src,dst,error)) { s.status="Paste failed: "+error; return; }
+        if (overwrite) {
+            std::error_code ec;
+            if (fs::exists(dst, ec)) {
+                fs::remove_all(dst, ec);
+                if (ec) { s.status = "Paste failed: " + ec.message(); return false; }
+            }
+        }
+        if (!copyRecursive(src, dst, error)) {
+            s.status = "Paste failed: " + error;
+            return false;
+        }
     }
-    s.clipboard.paths.clear(); s.clipboard.cut=false; refresh(s); s.status="Paste complete";
+    return true;
+}
+
+static void continuePasteClipboard(ExplorerState& s) {
+    if (!s.vfs || !s.vfs->isLocal() || s.clipboard.paths.empty()) return;
+    const fs::path destDir = s.path;
+
+    while (s.pendingPasteIndex < s.clipboard.paths.size()) {
+        const fs::path src = s.clipboard.paths[s.pendingPasteIndex];
+        const fs::path dst = destDir / src.filename();
+        std::error_code ec;
+        if (fs::exists(dst, ec)) {
+            s.pendingPasteSource = src;
+            s.pendingPasteDestination = dst;
+            s.flags.pendingPasteCut = s.clipboard.cut;
+            s.modal = Modal::PasteOverwrite;
+            s.menu.open = false;
+            unfocus(s);
+            return;
+        }
+        if (!finishPasteOne(s, src, dst, s.clipboard.cut, false)) {
+            s.clipboard.paths.clear();
+            s.clipboard.cut = false;
+            s.pendingPasteIndex = 0;
+            refresh(s);
+            return;
+        }
+        ++s.pendingPasteIndex;
+    }
+
+    s.clipboard.paths.clear();
+    s.clipboard.cut = false;
+    s.pendingPasteIndex = 0;
+    refresh(s);
+    s.status = "Paste complete";
 }
 
 static void pasteClipboard(ExplorerState& s) {
     if (!s.vfs || !s.vfs->isLocal() || s.clipboard.paths.empty()) return;
-    const fs::path destDir=s.path;
-    for (const auto& src : s.clipboard.paths) {
-        const fs::path dst=destDir/src.filename();
-        std::error_code ec;
-        if (fs::exists(dst,ec)) {
-            s.pendingPasteSource=src; s.pendingPasteDestination=dst; s.flags.pendingPasteCut=s.clipboard.cut;
-            s.modal=Modal::PasteOverwrite; s.menu.open=false; unfocus(s); return;
-        }
-    }
-    for (const auto& src : s.clipboard.paths) finishPasteOne(s,src,destDir/src.filename(),s.clipboard.cut,false);
+    s.pendingPasteIndex = 0;
+    continuePasteClipboard(s);
 }
 
 
@@ -1999,17 +2136,39 @@ static void startPropertiesForPath(ExplorerState& s, const fs::path& p) {
     std::error_code ec;
     if (!fs::exists(p, ec)) { s.status="Path no longer exists"; return; }
     s.props.path=p.string();
+    s.props.multi=false;
+    s.props.selectedCount=1;
     pathInfo(p.string(),s.magic,s.props.magic.description,s.props.magic.mime,s.props.mode);
     bitsToModeEdit(s.props);
     s.props.itemCount=0;
     s.props.totalSize=directorySizeRecursive(p,s.props.itemCount);
+    const auto ft = fs::last_write_time(p, ec);
+    s.props.mtime = ec ? 0 : fileTimeToTimeT(ft);
     s.modal=Modal::Properties; s.modalError.clear(); unfocus(s); s.menu.open=false;
 }
 
 static void startProperties(ExplorerState& s) {
     const auto ids=selectedRows(s);
-    if (ids.size()!=1 || !s.vfs || !s.vfs->isLocal()) { s.status="Properties are available for one local item"; return; }
-    startPropertiesForPath(s, fs::path(s.rows[ids.front()].path));
+    if (ids.empty() || !s.vfs || !s.vfs->isLocal()) { s.status="Properties are available for local items"; return; }
+    if (ids.size() == 1) {
+        startPropertiesForPath(s, fs::path(s.rows[ids.front()].path));
+        return;
+    }
+    s.props = PropertiesState{};
+    s.props.multi = true;
+    s.props.selectedCount = ids.size();
+    s.props.path = std::to_string(ids.size()) + " selected items";
+    for (int idx : ids) {
+        if (idx < 0 || idx >= (int)s.rows.size()) continue;
+        const fs::path p = fs::path(s.rows[idx].path);
+        std::uint64_t count = 0;
+        s.props.totalSize += directorySizeRecursive(p, count);
+        s.props.itemCount += count ? count : 1;
+    }
+    s.modal = Modal::Properties;
+    s.modalError.clear();
+    unfocus(s);
+    s.menu.open = false;
 }
 
 static void startCurrentDirectoryProperties(ExplorerState& s) {
@@ -2031,6 +2190,7 @@ static void applyRename(ExplorerState& s) {
 }
 
 static void saveProperties(ExplorerState& s) {
+    if (s.props.multi) { s.modal=Modal::None; unfocus(s); return; }
     modeToBits(s.props);
     if (s.props.path.empty()) return;
     if (::chmod(s.props.path.c_str(), s.props.mode & 07777) != 0) { s.modalError=std::strerror(errno); return; }
@@ -2045,13 +2205,18 @@ static std::string shellQuote(const std::string& in) {
 }
 
 static bool spawnShellInDir(const fs::path& dir, const std::string& command, bool inheritIO=true) {
-    pid_t pid=fork();
-    if(pid<0) return false;
-    if(pid==0){
+    pid_t leader=fork();
+    if(leader<0) return false;
+    if(leader==0){
+        if(setsid()<0) _exit(126);
+        pid_t child=fork();
+        if(child<0) _exit(126);
+        if(child>0) _exit(0);
         if(chdir(dir.c_str())!=0) _exit(126);
         if(!inheritIO){ int devnull=open("/dev/null",O_RDWR); if(devnull>=0){dup2(devnull,0);dup2(devnull,1);dup2(devnull,2);close(devnull);} }
         execl("/bin/sh","sh","-lc",command.c_str(),(char*)nullptr); _exit(127);
     }
+    int status=0; (void)waitpid(leader,&status,0);
     return true;
 }
 
@@ -2482,7 +2647,7 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
         DrawText("Navigation",(int)box.x+20,(int)box.y+58, uiFont(15), t.accent);
         const char* lines[] = {
             "/                 Focus path (keep text)", "Ctrl+/             Clear + focus path", "Ctrl+L             Focus/select path", "Tab                Complete path/command", "Enter              Open / activate", "Arrow keys         Navigate selection", "PageUp/PageDown    Page through items", "Backspace          Parent directory", "Alt+Left/Right     History", "Ctrl+T/W/Tab        New/close/switch tab",
-            "Ctrl+1..9          Switch tab", "Ctrl+F             Focus search", "Ctrl+H             Show/hide hidden files", "Ctrl+A             Select all", "Ctrl+C/X/V         Copy/cut/paste", "Delete / Shift+Del Trash / permanent delete", "F2                 Rename", "F7 / Ctrl+Shift+N   New directory", "Ctrl+Alt+N          New file", "F6                 cat / text viewer", "F8                 Copy current directory path", "F9                 Open terminal here", "Ctrl+Home          Jump to Home", "Ctrl+Shift+A        Compress", "X                  Extract selected archive", "Ctrl+Wheel          Change view zoom", "1..4               Details/List/Medium/Large", "F3                 Theme picker (0..10)", "`                  Run command here", "Tab                Path/command completion", "F1                 This help", "F4                About", "Config: show_thumbnails=1 + thumbnail_res=1..5 (32/64/128/256/512px); thumbnails use a visible-set-aware bounded cache (96 medium / 48 large).", "Ctrl+Q             Quit", "Esc                Close active window/menu"
+            "Ctrl+1..9          Switch tab", "Ctrl+F             Focus search", "Ctrl+H             Show/hide hidden files", "Ctrl+A             Select all", "Ctrl+C/X/V         Copy/cut/paste", "Delete / Shift+Del Trash / permanent delete", "F2                 Rename", "F7 / Ctrl+Shift+N   New directory", "Ctrl+Alt+N          New file", "F6                 cat / text viewer", "F8                 Copy current directory path", "F9                 Open terminal here", "Ctrl+Home          Jump to Home", "A-Z                Focus search and start typing", "Ctrl+Shift+A        Compress", "X                  Extract selected archive", "Ctrl+Wheel          Change view zoom", "1..4               Details/List/Medium/Large", "F3                 Theme picker (0..10)", "`                  Run command here", "Tab                Path/command completion", "F1                 This help", "F4                About", "Config: show_thumbnails=1 + thumbnail_res=1..5 (32/64/128/256/512px); thumbnails use a visible-set-aware bounded cache (96 medium / 48 large).", "Ctrl+Q             Quit", "Esc                Close active window/menu"
         };
         int y=(int)box.y+86; for(const char* line:lines){ DrawText(line,(int)box.x+20,y, uiFont(12), t.text); y+=14; if(y>box.y+392) break; }
         DrawText("Details view always shows Name, Date modified, Type and Size.",(int)box.x+20,(int)box.y+402, uiFont(12), t.muted);
@@ -2689,6 +2854,17 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
     }
 
     if (s.modal==Modal::Properties) {
+        if (s.props.multi) {
+            DrawText("Multiple items", (int)box.x+20, (int)box.y+54, uiFont(18), t.text);
+            DrawText((std::to_string(s.props.selectedCount)+" selected items").c_str(), (int)box.x+20, (int)box.y+84, uiFont(14), t.muted);
+            DrawText(("Total size: "+formatBytes(s.props.totalSize)).c_str(), (int)box.x+20, (int)box.y+120, uiFont(15), t.text);
+            DrawText(("Contained items: "+std::to_string(s.props.itemCount)).c_str(), (int)box.x+20, (int)box.y+148, uiFont(13), t.muted);
+            DrawText("Selection summary; permissions are not editable for multiple items.", (int)box.x+20, (int)box.y+184, uiFont(12), t.muted);
+            Rectangle closeR{box.x+440, box.y+210, 70, 32};
+            DrawRectangleRec(closeR, t.panel); DrawRectangleLinesEx(closeR, 1, t.line);
+            DrawText("Close", (int)closeR.x+16, (int)closeR.y+8, uiFont(13), t.text);
+            return;
+        }
         const fs::path p=s.props.path;
         DrawText(p.filename().string().c_str(),(int)box.x+20,(int)box.y+54, uiFont(18), t.text);
         DrawText(p.string().c_str(),(int)box.x+20,(int)box.y+77, uiFont(12), t.muted);
@@ -2696,20 +2872,21 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
         DrawText(("MIME: "+s.props.magic.mime).c_str(),(int)box.x+20,(int)box.y+129, uiFont(12), t.muted);
         DrawText(("Size: "+formatBytes(s.props.totalSize)).c_str(),(int)box.x+20,(int)box.y+151, uiFont(12), t.text);
         DrawText(("Items: "+std::to_string(s.props.itemCount)).c_str(),(int)box.x+250,(int)box.y+151, uiFont(12), t.muted);
-        DrawText("Permissions",(int)box.x+20,(int)box.y+178, uiFont(15), t.text);
-        DrawText("Octal",(int)box.x+20,(int)box.y+204, uiFont(12), t.muted);
-        Rectangle modeR{box.x+68,box.y+197,90,31}; DrawRectangleRec(modeR,t.bg); DrawRectangleLinesEx(modeR,1,s.focusedField==TextField::Mode?t.accent:t.line); DrawText(s.props.modeEdit.c_str(),(int)modeR.x+8,(int)modeR.y+7, uiFont(14), t.text);
-        DrawText("User",(int)box.x+35,(int)box.y+248, uiFont(12), t.muted); DrawText("Group",(int)box.x+205,(int)box.y+248, uiFont(12), t.muted); DrawText("Other",(int)box.x+375,(int)box.y+248, uiFont(12), t.muted);
+        DrawText(("Modified: "+formatTime(s.props.mtime)).c_str(),(int)box.x+20,(int)box.y+173, uiFont(12), t.text);
+        DrawText("Permissions",(int)box.x+20,(int)box.y+198, uiFont(15), t.text);
+        DrawText("Octal",(int)box.x+20,(int)box.y+224, uiFont(12), t.muted);
+        Rectangle modeR{box.x+68,box.y+217,90,31}; DrawRectangleRec(modeR,t.bg); DrawRectangleLinesEx(modeR,1,s.focusedField==TextField::Mode?t.accent:t.line); DrawText(s.props.modeEdit.c_str(),(int)modeR.x+8,(int)modeR.y+7, uiFont(14), t.text);
+        DrawText("User",(int)box.x+35,(int)box.y+268, uiFont(12), t.muted); DrawText("Group",(int)box.x+205,(int)box.y+268, uiFont(12), t.muted); DrawText("Other",(int)box.x+375,(int)box.y+268, uiFont(12), t.muted);
         static const char* labels[3] = {"R","W","X"};
         static const mode_t bits[3][3]={{S_IRUSR,S_IWUSR,S_IXUSR},{S_IRGRP,S_IWGRP,S_IXGRP},{S_IROTH,S_IWOTH,S_IXOTH}};
         for(int c=0;c<3;++c) for(int r=0;r<3;++r) {
-            Rectangle cb{box.x+25+c*170+r*44,box.y+270,16,16}; drawCheckbox(cb,(s.props.mode&bits[c][r])!=0,labels[r],t.text,t.accent);
+            Rectangle cb{box.x+25+c*170+r*44,box.y+290,16,16}; drawCheckbox(cb,(s.props.mode&bits[c][r])!=0,labels[r],t.text,t.accent);
         }
-        DrawText("chmod is applied to the local filesystem item.",(int)box.x+20,(int)box.y+320, uiFont(12), t.muted);
-        DrawText("Enter = edit octal field     Click Save to apply     Esc = cancel",(int)box.x+20,(int)box.y+350, uiFont(13), t.text);
-        DrawRectangleRec({box.x+440,box.y+344,70,32},t.panel); DrawRectangleLinesEx({box.x+440,box.y+344,70,32}, 1, t.accent); DrawText("Save",(int)box.x+458,(int)box.y+353, uiFont(13), t.text);
-        DrawRectangleRec({box.x+515,box.y+344,45,32},t.panel); DrawRectangleLinesEx({box.x+515,box.y+344,45,32}, 1, t.line); DrawText("Esc",(int)box.x+525,(int)box.y+353, uiFont(12), t.text);
-        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+382, uiFont(12), Color{255,100,100,255});
+        DrawText("chmod is applied to the local filesystem item.",(int)box.x+20,(int)box.y+340, uiFont(12), t.muted);
+        DrawText("Enter = edit octal field     Click Save to apply     Esc = cancel",(int)box.x+20,(int)box.y+370, uiFont(13), t.text);
+        DrawRectangleRec({box.x+440,box.y+364,70,32},t.panel); DrawRectangleLinesEx({box.x+440,box.y+364,70,32}, 1, t.accent); DrawText("Save",(int)box.x+458,(int)box.y+373, uiFont(13), t.text);
+        DrawRectangleRec({box.x+515,box.y+364,45,32},t.panel); DrawRectangleLinesEx({box.x+515,box.y+364,45,32}, 1, t.line); DrawText("Esc",(int)box.x+525,(int)box.y+373, uiFont(12), t.text);
+        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+402, uiFont(12), Color{255,100,100,255});
     }
 }
 
@@ -3183,7 +3360,14 @@ int main(int argc, char** argv) {
             if (isAltDown() && IsKeyPressed(KEY_LEFT) && st.historyIndex>0) { --st.historyIndex; navigate(st,st.history[st.historyIndex],false); }
             if (isAltDown() && IsKeyPressed(KEY_RIGHT) && st.historyIndex+1<(int)st.history.size()) { ++st.historyIndex; navigate(st,st.history[st.historyIndex],false); }
             if (isAltDown() && IsKeyPressed(KEY_UP)) if (auto p=st.vfs->parent(st.path)) navigate(st,*p,true);
-            // Letter-jump is intentionally disabled; A-Z remain ordinary no-op keys here.
+            if (st.focusedField==TextField::None && st.modal==Modal::None && !st.menu.open && !isCtrlDown() && !isAltDown()) {
+                int cp = GetCharPressed();
+                if (cp>0 && ((cp>='A' && cp<='Z') || (cp>='a' && cp<='z'))) {
+                    focus(st,TextField::Search,false);
+                    st.editor.replace(std::string(1,(char)cp));
+                    updateFilter(st);
+                }
+            }
             if (st.focusedField==TextField::None && !isCtrlDown()) {
                 if (IsKeyPressed(KEY_ONE)) st.view=ViewMode::Details;
                 if (IsKeyPressed(KEY_TWO)) st.view=ViewMode::List;
@@ -3219,7 +3403,14 @@ int main(int argc, char** argv) {
         }
 
         if (st.modal==Modal::CreateArchive || st.modal==Modal::ExtractArchive) processArchiveModalInput(st);
-        if (st.modal==Modal::PasteOverwrite && IsKeyPressed(KEY_ENTER)) { finishPasteOne(st,st.pendingPasteSource,st.pendingPasteDestination,st.flags.pendingPasteCut,true); st.modal=Modal::None; unfocus(st); }
+        if (st.modal==Modal::PasteOverwrite && IsKeyPressed(KEY_ENTER)) {
+            if (finishPasteOne(st, st.pendingPasteSource, st.pendingPasteDestination, st.flags.pendingPasteCut, true)) {
+                ++st.pendingPasteIndex;
+                st.modal = Modal::None;
+                unfocus(st);
+                continuePasteClipboard(st);
+            }
+        }
         if (st.modal==Modal::ConfirmPermanentDelete && IsKeyPressed(KEY_ENTER)) applyPermanentDelete(st);
         if (st.modal==Modal::NewItem && IsKeyPressed(KEY_ENTER)) { createNewItem(st); }
         if (st.modal==Modal::ImageView) {
@@ -3409,7 +3600,7 @@ int main(int argc, char** argv) {
             DrawText((std::string("Type ")+(st.sortKey==SortKey::Type?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+700,top+11, uiFont(13), t.muted);
             DrawText((std::string("Size ")+(st.sortKey==SortKey::Size?(st.flags.sortAscending?"^":"v"):"" )).c_str(),left+770,top+11, uiFont(13), t.muted);
         }
-        else DrawText(st.vfs?st.vfs->displayPath().c_str():st.path.c_str(),left+14,top+11, uiFont(13), t.muted);
+        else { const std::string displayPath=currentDisplayPath(st); DrawText(displayPath.c_str(),left+14,top+11, uiFont(13), t.muted); }
 
         int hoverRow=-1;
         st.thumbnailProtected.clear();
@@ -3451,6 +3642,14 @@ int main(int argc, char** argv) {
                 int tw=MeasureText(label.c_str(),uiFont(13)); int tx=x+std::max(4,((int)rr.width-tw)/2);
                 DrawText(label.c_str(),tx,y+icon+16, uiFont(13), t.text);
             }
+        }
+
+        if(st.selectionDragging && st.selectionDragMoved){
+            Rectangle dr=normalizedRect(st.selectionDragStart,st.selectionDragCurrent);
+            Rectangle clip{(float)left,(float)top,(float)(W-left),(float)contentH};
+            const float x1=std::max(dr.x,clip.x), y1=std::max(dr.y,clip.y);
+            const float x2=std::min(dr.x+dr.width,clip.x+clip.width), y2=std::min(dr.y+dr.height,clip.y+clip.height);
+            if(x2>x1 && y2>y1){Rectangle rr{x1,y1,x2-x1,y2-y1};DrawRectangleRec(rr,Fade(t.accent,0.16f));DrawRectangleLinesEx(rr,1.0f,t.accent);}
         }
 
         // Status bar
@@ -3575,8 +3774,41 @@ int main(int argc, char** argv) {
                         Rectangle cr{8.0f,(float)fy-5,st.sidebarW-16.0f,28}; if(pointIn(cr,mouse)){openLocalPath(st,configBase());hit=true;}
                     }
                     if(!hit){st.selection.clear();unfocus(st);}
-                } else if(hoverRow>=0){if(isShiftDown())selectRange(st,hoverRow);else selectSingle(st,hoverRow,isCtrlDown());static double last=0;static int lastRow=-1;double now=GetTime();if(lastRow==hoverRow&&now-last<0.35)openSelected(st);lastRow=hoverRow;last=now;}
-                else {st.selection.clear();unfocus(st);}
+                } else if(pointIn(listR,mouse)){
+                    st.selectionDragging=true;
+                    st.selectionDragMoved=false;
+                    st.selectionDragStart=mouse;
+                    st.selectionDragCurrent=mouse;
+                    st.selectionDragAdditive=isCtrlDown();
+                    st.selectionDragBase=st.selectionDragAdditive?st.selection:std::set<int>{};
+                    if(hoverRow>=0){
+                        if(isShiftDown()) selectRange(st,hoverRow);
+                        else selectSingle(st,hoverRow,isCtrlDown());
+                    } else if(!isCtrlDown()){
+                        st.selection.clear();
+                        st.selected=-1;
+                        st.anchorSelection=-1;
+                    }
+                    unfocus(st);
+                } else {st.selection.clear();unfocus(st);}
+            }
+        }
+
+        if(st.modal==Modal::None && st.selectionDragging){
+            if(IsMouseButtonDown(MOUSE_BUTTON_LEFT)){
+                const Vector2 m=GetMousePosition();
+                if(std::fabs(m.x-st.selectionDragStart.x)>4.0f || std::fabs(m.y-st.selectionDragStart.y)>4.0f) st.selectionDragMoved=true;
+                st.selectionDragCurrent=m;
+                if(st.selectionDragMoved) updateDragSelection(st,left,top,contentH,W);
+            }
+            if(IsMouseButtonReleased(MOUSE_BUTTON_LEFT)){
+                const bool moved=st.selectionDragMoved; st.selectionDragging=false; st.selectionDragMoved=false;
+                if(moved) updateDragSelection(st,left,top,contentH,W);
+                else if(hoverRow>=0){
+                    static double lastClickTime=0.0; static int lastClickRow=-1; const double now=GetTime();
+                    if(lastClickRow==hoverRow && now-lastClickTime<0.35) openSelected(st);
+                    lastClickRow=hoverRow; lastClickTime=now;
+                }
             }
         }
 
@@ -3627,18 +3859,30 @@ int main(int argc, char** argv) {
         }
         if(st.modal==Modal::PasteOverwrite && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
             Rectangle box{W*0.5f-290,H*0.5f-220,580,440}; Rectangle apply{box.x+360,box.y+180,100,32}, cancel{box.x+470,box.y+180,70,32};
-            if(pointIn(apply,mouse)){ finishPasteOne(st,st.pendingPasteSource,st.pendingPasteDestination,st.flags.pendingPasteCut,true); st.modal=Modal::None; unfocus(st); }
+            if(pointIn(apply,mouse)){
+                if (finishPasteOne(st, st.pendingPasteSource, st.pendingPasteDestination, st.flags.pendingPasteCut, true)) {
+                    ++st.pendingPasteIndex;
+                    st.modal = Modal::None;
+                    unfocus(st);
+                    continuePasteClipboard(st);
+                }
+            }
             else if(pointIn(cancel,mouse)){ st.modal=Modal::None; unfocus(st); }
         }
         if(st.modal==Modal::Properties && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            // Mode editor field
             Rectangle box{W*0.5f-290,H*0.5f-220,580,440};
-            Rectangle modeR{box.x+68,box.y+197,90,31};
+            if (st.props.multi) {
+                Rectangle closeR{box.x+440, box.y+210, 70, 32};
+                if (pointIn(closeR, mouse)) { st.modal=Modal::None; unfocus(st); }
+            } else {
+            // Mode editor field
+            Rectangle modeR{box.x+68,box.y+217,90,31};
             if(pointIn(modeR,mouse)) focus(st,TextField::Mode,false);
-            for(int c=0;c<3;++c)for(int r=0;r<3;++r){Rectangle cb{box.x+25+c*170+r*44,box.y+270,16,16};if(pointIn(cb,mouse)){modeToBits(st.props);toggleModeBit(st.props,c,r);}}
-            Rectangle saveR{box.x+440,box.y+344,70,32}, cancelR{box.x+515,box.y+344,45,32};
+            for(int c=0;c<3;++c)for(int r=0;r<3;++r){Rectangle cb{box.x+25+c*170+r*44,box.y+290,16,16};if(pointIn(cb,mouse)){modeToBits(st.props);toggleModeBit(st.props,c,r);}}
+            Rectangle saveR{box.x+440,box.y+364,70,32}, cancelR{box.x+515,box.y+364,45,32};
             if(pointIn(saveR,mouse)) { saveProperties(st); }
             if(pointIn(cancelR,mouse)) { st.modal=Modal::None; unfocus(st); }
+            }
         }
         if(st.modal==Modal::NewItem && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
             Rectangle box{W*0.5f-290,H*0.5f-220,580,440},saveR{box.x+390,box.y+105,85,32},cancelR{box.x+485,box.y+105,65,32};
