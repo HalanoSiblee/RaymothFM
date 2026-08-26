@@ -45,7 +45,7 @@ namespace fs = std::filesystem;
 enum class EntryKind { Directory, File, Archive };
 enum class ViewMode { Details = 1, List = 2, MediumIcons = 3, LargeIcons = 4 };
 enum class SortKey { Name, Size, Date, Type };
-enum class TextField { None, Search, Address, Rename, NewItem, Mode, ArchiveOutput, ConvertOutput, ExtractDestination, ArchivePassword, Command, ThemeNumber, EditorConfig, TermConfig, AccentConfig, FontScale };
+enum class TextField { None, Search, Address, Rename, NewItem, Mode, ArchiveOutput, ConvertOutput, ExtractDestination, ArchivePassword, Command, ThemeNumber, EditorConfig, TermConfig, AccentConfig, FontScale, XdgMimeDesktop };
 enum class ArchiveFormat { Tar, Pax, Ustar, Zip, SevenZip, Cpio };
 enum class ArchiveCompression { None, Gzip, Bzip2, Xz, Zstd, Lz4, Lzma, Lzip };
 
@@ -625,6 +625,8 @@ struct ClipboardBuffer {
 struct PropertiesState {
     std::string path;
     MagicInfo magic;
+    std::string xdgMimeType;
+    std::string xdgDesktop;
     mode_t mode = 0644;
     std::string modeEdit = "0644";
     std::uintmax_t totalSize = 0;
@@ -1198,6 +1200,7 @@ static void focus(ExplorerState& s, TextField f, bool all=false) {
     else if (f == TextField::TermConfig) s.editor.begin(&s.termEdit, all);
     else if (f == TextField::AccentConfig) s.editor.begin(&s.accentEdit, all);
     else if (f == TextField::FontScale) s.editor.begin(&s.fontScaleEdit, all);
+    else if (f == TextField::XdgMimeDesktop) s.editor.begin(&s.props.xdgDesktop, all);
 }
 static void focusAt(ExplorerState& s, TextField f, float mouseX, float leftOffset, int fontSize=14) {
     focus(s,f,false);
@@ -1860,7 +1863,10 @@ static void drawEntryIcon(const VfsEntry& e, int x, int y, int targetSize, Color
     rayicons::Draw(iconForEntry(e),x,y,std::max(1,targetSize/16),c);
 }
 
-static bool pointIn(Rectangle r, Vector2 p) { return CheckCollisionPointRec(p,r); }
+static bool controlContains(Rectangle r, Vector2 p) { return CheckCollisionPointRec(p,r); }
+static bool controlClicked(Rectangle r, Vector2 p) { return controlContains(r,p) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT); }
+// UI rule: controls are clickable on the exact Rectangle that is drawn; no offset hitboxes.
+#define pointIn controlContains
 
 static void pathInfo(const fs::path& p, const MagicDatabase& magic, std::string& desc, std::string& mime, mode_t& mode) {
     struct stat st{};
@@ -2119,11 +2125,15 @@ static std::vector<DiskMountInfo> collectDiskMounts(){
     std::vector<DiskMountInfo> out; std::ifstream in("/proc/self/mounts"); std::string src,mnt,fstype,opts,a,b; std::set<std::string> seen;
     while(in>>src>>mnt>>fstype>>opts>>a>>b){
         src=unescapeMountField(src); mnt=unescapeMountField(mnt);
-        if(mnt.empty()||mnt[0]!='/'||seen.count(mnt))continue; struct statvfs st{}; if(::statvfs(mnt.c_str(),&st)!=0)continue;
+        if(mnt.empty()||mnt[0]!='/'||seen.count(mnt)) continue;
+        struct statvfs st{};
+        if(::statvfs(mnt.c_str(),&st)!=0) continue;
         std::uint64_t total=std::uint64_t(st.f_blocks)*std::uint64_t(st.f_frsize), free=std::uint64_t(st.f_bavail)*std::uint64_t(st.f_frsize), used=total>free?total-free:0;
         bool root=mnt=="/", dev=src.rfind("/dev/",0)==0||src.rfind("UUID=",0)==0||src.rfind("LABEL=",0)==0;
         bool pseudo=fstype=="proc"||fstype=="sysfs"||fstype=="devpts"||fstype=="cgroup"||fstype=="cgroup2"||fstype=="mqueue"||fstype=="pstore"||fstype=="debugfs"||fstype=="tracefs"||fstype=="securityfs";
-        if(!root&&!dev&&pseudo)continue; seen.insert(mnt); out.push_back({src,fs::path(mnt),fstype,total,used,free});
+        if(!root&&!dev&&pseudo) continue;
+        seen.insert(mnt);
+        out.push_back({src,fs::path(mnt),fstype,total,used,free});
     }
     std::sort(out.begin(),out.end(),[](const auto&a,const auto&b){if(a.mountpoint=="/")return true;if(b.mountpoint=="/")return false;return a.mountpoint.string()<b.mountpoint.string();});
     return out;
@@ -2131,6 +2141,52 @@ static std::vector<DiskMountInfo> collectDiskMounts(){
 static std::string diskPercent(const DiskMountInfo& d){ if(!d.total)return "0.0%"; char b[32]; std::snprintf(b,sizeof(b),"%.1f%%",100.0*(double)d.used/(double)d.total); return b; }
 static std::string mountLabel(const DiskMountInfo& d){ if(d.mountpoint=="/")return "Root (/)"; std::string s=d.mountpoint.string(); if(s.size()>20)s=s.substr(0,17)+"..."; return s; }
 static void openDiskInfo(ExplorerState& s){ s.diskInfo.mounts=collectDiskMounts(); if(s.diskInfo.mounts.empty()){s.status="No mounted filesystems available";return;} s.diskInfo.tab=0;s.diskInfo.firstTab=0;s.modal=Modal::DiskInfo;s.menu.open=false;unfocus(s); }
+
+static std::string trimCommandOutput(std::string v) {
+    while(!v.empty() && (v.back()=='\n' || v.back()=='\r' || v.back()==' ' || v.back()=='\t')) v.pop_back();
+    size_t first=0; while(first<v.size() && (v[first]==' ' || v[first]=='\t' || v[first]=='\r' || v[first]=='\n')) ++first;
+    if(first) v.erase(0,first);
+    return v;
+}
+
+static std::string runCaptureCommand(const std::string& command, int* exitStatus=nullptr) {
+    FILE* fp=popen(command.c_str(), "r");
+    if(!fp){ if(exitStatus) *exitStatus=-1; return {}; }
+    std::string out; char buf[256];
+    while(std::fgets(buf,sizeof(buf),fp)) out += buf;
+    const int rc=pclose(fp);
+    if(exitStatus) *exitStatus=rc;
+    return trimCommandOutput(out);
+}
+
+static void queryXdgMimeForPath(ExplorerState& s) {
+    s.props.xdgMimeType.clear();
+    s.props.xdgDesktop.clear();
+    if(s.props.path.empty()) return;
+    const std::string path=shellQuote(s.props.path);
+    int rc=0;
+    s.props.xdgMimeType=runCaptureCommand("xdg-mime query filetype " + path, &rc);
+    if(rc!=0 || s.props.xdgMimeType.empty()) {
+        s.props.xdgMimeType=s.props.magic.mime;
+        if(s.props.xdgMimeType.empty()) s.modalError="xdg-mime could not determine MIME type";
+        return;
+    }
+    const std::string q=runCaptureCommand("xdg-mime query default " + shellQuote(s.props.xdgMimeType), &rc);
+    if(rc==0) s.props.xdgDesktop=q;
+}
+
+static void applyXdgMimeDefault(ExplorerState& s) {
+    const std::string mime=trimCommandOutput(s.props.xdgMimeType);
+    const std::string desktop=trimCommandOutput(s.props.xdgDesktop);
+    if(mime.empty()){ s.modalError="No MIME type available"; return; }
+    if(desktop.empty()){ s.modalError="Enter an application .desktop file"; return; }
+    int rc=std::system(("xdg-mime default " + shellQuote(desktop) + " " + shellQuote(mime)).c_str());
+    if(rc!=0){ s.modalError="xdg-mime could not set the default application"; return; }
+    s.modalError.clear();
+    s.status="Default application for " + mime + " set to " + desktop;
+    const std::string verify=runCaptureCommand("xdg-mime query default " + shellQuote(mime));
+    if(!verify.empty()) s.props.xdgDesktop=verify;
+}
 
 static void startPropertiesForPath(ExplorerState& s, const fs::path& p) {
     if (!s.vfs || !s.vfs->isLocal() || p.empty()) { s.status="Properties are available for local files and directories"; return; }
@@ -2140,6 +2196,7 @@ static void startPropertiesForPath(ExplorerState& s, const fs::path& p) {
     s.props.multi=false;
     s.props.selectedCount=1;
     pathInfo(p.string(),s.magic,s.props.magic.description,s.props.magic.mime,s.props.mode);
+    queryXdgMimeForPath(s);
     bitsToModeEdit(s.props);
     s.props.itemCount=0;
     s.props.totalSize=directorySizeRecursive(p,s.props.itemCount);
@@ -2568,10 +2625,24 @@ static void cycleConvertField(ExplorerState& s,int field,int delta) {
     }
 }
 
+struct PropertiesLayout {
+    Rectangle box{}; Rectangle mime{}; Rectangle mimeApply{}; Rectangle mode{}; Rectangle save{}; Rectangle close{}; bool multi=false;
+};
+static PropertiesLayout propertiesLayout(int W,int H,bool multi){
+    PropertiesLayout l; l.multi=multi; const float w=multi?580.0f:680.0f, h=multi?440.0f:560.0f;
+    l.box={W*0.5f-w*0.5f,H*0.5f-h*0.5f,w,h};
+    if(multi) l.close={l.box.x+440,l.box.y+210,70,32};
+    else { l.mime={l.box.x+20,l.box.y+228,510,36}; l.mimeApply={l.box.x+540,l.box.y+228,110,36}; l.mode={l.box.x+68,l.box.y+312,105,34}; l.save={l.box.x+500,l.box.y+398,90,34}; l.close={l.box.x+600,l.box.y+398,62,34}; }
+    return l;
+}
+
 static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
     DrawRectangle(0,0,W,H,Fade(BLACK,0.62f));
     const bool largeDialog=(s.modal==Modal::Help);
-    Rectangle box{W*0.5f-(largeDialog?350.0f:290.0f),H*0.5f-(largeDialog?280.0f:220.0f),largeDialog?700.0f:580.0f,largeDialog?560.0f:440.0f};
+    const bool largeProperties=(s.modal==Modal::Properties && !s.props.multi);
+    const float dialogW = largeDialog ? 700.0f : (largeProperties ? 680.0f : 580.0f);
+    const float dialogH = largeDialog ? 560.0f : (largeProperties ? 560.0f : 440.0f);
+    Rectangle box{W*0.5f-dialogW*0.5f,H*0.5f-dialogH*0.5f,dialogW,dialogH};
     DrawRectangleRec(box,t.panel2); DrawRectangleLinesEx(box, 1, t.line);
     const std::string title = s.modal==Modal::Properties?"Properties":s.modal==Modal::DiskInfo?"Disk usage":s.modal==Modal::Rename?"Rename":s.modal==Modal::NewItem?(s.flags.newItemDirectory?"New directory":"New file"):s.modal==Modal::CreateArchive?"Create archive":s.modal==Modal::ExtractArchive?"Extract archive":s.modal==Modal::ConvertImage?"Convert image":s.modal==Modal::Command?"Run command here":s.modal==Modal::Help?"Keyboard shortcuts":s.modal==Modal::About?"About raymothfm":s.modal==Modal::ThemePicker?"Theme picker":s.modal==Modal::PasteOverwrite?"Confirm overwrite":s.modal==Modal::ConfirmPermanentDelete?"Permanent delete":s.modal==Modal::Checksum?"Checksum":"raymothfm";
     DrawText(title.c_str(),(int)box.x+20,(int)box.y+18, uiFont(20), t.text);
@@ -2874,20 +2945,26 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
         DrawText(("Size: "+formatBytes(s.props.totalSize)).c_str(),(int)box.x+20,(int)box.y+151, uiFont(12), t.text);
         DrawText(("Items: "+std::to_string(s.props.itemCount)).c_str(),(int)box.x+250,(int)box.y+151, uiFont(12), t.muted);
         DrawText(("Modified: "+formatTime(s.props.mtime)).c_str(),(int)box.x+20,(int)box.y+173, uiFont(12), t.text);
-        DrawText("Permissions",(int)box.x+20,(int)box.y+198, uiFont(15), t.text);
-        DrawText("Octal",(int)box.x+20,(int)box.y+224, uiFont(12), t.muted);
-        Rectangle modeR{box.x+68,box.y+217,90,31}; DrawRectangleRec(modeR,t.bg); DrawRectangleLinesEx(modeR,1,s.focusedField==TextField::Mode?t.accent:t.line); DrawText(s.props.modeEdit.c_str(),(int)modeR.x+8,(int)modeR.y+7, uiFont(14), t.text);
-        DrawText("User",(int)box.x+35,(int)box.y+268, uiFont(12), t.muted); DrawText("Group",(int)box.x+205,(int)box.y+268, uiFont(12), t.muted); DrawText("Other",(int)box.x+375,(int)box.y+268, uiFont(12), t.muted);
+        DrawText(("XDG MIME: "+(s.props.xdgMimeType.empty()?s.props.magic.mime:s.props.xdgMimeType)).c_str(),(int)box.x+20,(int)box.y+195, uiFont(12), t.text);
+        DrawText("Default application (.desktop)",(int)box.x+20,(int)box.y+219, uiFont(12), t.muted);
+        Rectangle mimeR=propertiesLayout(W,H,false).mime; DrawRectangleRec(mimeR,t.bg); DrawRectangleLinesEx(mimeR,1,s.focusedField==TextField::XdgMimeDesktop?t.accent:t.line);
+        if(s.focusedField==TextField::XdgMimeDesktop) drawInlineEditor(mimeR,s.props.xdgDesktop,s.editor,t,13); else DrawText(s.props.xdgDesktop.empty()?"(no default application)":s.props.xdgDesktop.c_str(),(int)mimeR.x+8,(int)mimeR.y+8,uiFont(13),s.props.xdgDesktop.empty()?t.muted:t.text);
+        Rectangle mimeApply=propertiesLayout(W,H,false).mimeApply; DrawRectangleRec(mimeApply,t.panel); DrawRectangleLinesEx(mimeApply,1,t.accent); DrawText("Apply",(int)mimeApply.x+21,(int)mimeApply.y+8,uiFont(13),t.text);
+        DrawText("Runs xdg-mime query filetype/default; Apply changes only the MIME association.",(int)box.x+20,(int)box.y+269,uiFont(11),t.muted);
+        DrawText("Permissions",(int)box.x+20,(int)box.y+294, uiFont(15), t.text);
+        DrawText("Octal",(int)box.x+20,(int)box.y+319, uiFont(12), t.muted);
+        Rectangle modeR=propertiesLayout(W,H,false).mode; DrawRectangleRec(modeR,t.bg); DrawRectangleLinesEx(modeR,1,s.focusedField==TextField::Mode?t.accent:t.line); DrawText(s.props.modeEdit.c_str(),(int)modeR.x+8,(int)modeR.y+7, uiFont(14), t.text);
+        DrawText("User",(int)box.x+35,(int)box.y+363, uiFont(12), t.muted); DrawText("Group",(int)box.x+205,(int)box.y+363, uiFont(12), t.muted); DrawText("Other",(int)box.x+375,(int)box.y+363, uiFont(12), t.muted);
         static const char* labels[3] = {"R","W","X"};
         static const mode_t bits[3][3]={{S_IRUSR,S_IWUSR,S_IXUSR},{S_IRGRP,S_IWGRP,S_IXGRP},{S_IROTH,S_IWOTH,S_IXOTH}};
         for(int c=0;c<3;++c) for(int r=0;r<3;++r) {
-            Rectangle cb{box.x+25+c*170+r*44,box.y+290,16,16}; drawCheckbox(cb,(s.props.mode&bits[c][r])!=0,labels[r],t.text,t.accent);
+            Rectangle cb{box.x+25+c*170+r*44,box.y+385,16,16}; drawCheckbox(cb,(s.props.mode&bits[c][r])!=0,labels[r],t.text,t.accent);
         }
-        DrawText("chmod is applied to the local filesystem item.",(int)box.x+20,(int)box.y+340, uiFont(12), t.muted);
-        DrawText("Enter = edit octal field     Click Save to apply     Esc = cancel",(int)box.x+20,(int)box.y+370, uiFont(13), t.text);
-        DrawRectangleRec({box.x+440,box.y+364,70,32},t.panel); DrawRectangleLinesEx({box.x+440,box.y+364,70,32}, 1, t.accent); DrawText("Save",(int)box.x+458,(int)box.y+373, uiFont(13), t.text);
-        DrawRectangleRec({box.x+515,box.y+364,45,32},t.panel); DrawRectangleLinesEx({box.x+515,box.y+364,45,32}, 1, t.line); DrawText("Esc",(int)box.x+525,(int)box.y+373, uiFont(12), t.text);
-        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+402, uiFont(12), Color{255,100,100,255});
+        DrawText("chmod is applied to the local filesystem item.",(int)box.x+20,(int)box.y+420, uiFont(12), t.muted);
+        DrawText("Enter = edit octal field     Save = permissions only     Esc = cancel",(int)box.x+20,(int)box.y+444, uiFont(12), t.text);
+        DrawRectangleRec({box.x+500,box.y+398,90,34},t.panel); DrawRectangleLinesEx({box.x+500,box.y+398,90,34}, 1, t.accent); DrawText("Save",(int)box.x+526,(int)box.y+408, uiFont(13), t.text);
+        DrawRectangleRec({box.x+600,box.y+398,62,34},t.panel); DrawRectangleLinesEx({box.x+600,box.y+398,62,34}, 1, t.line); DrawText("Close",(int)box.x+611,(int)box.y+408, uiFont(12), t.text);
+        if (!s.modalError.empty()) DrawText(s.modalError.c_str(),(int)box.x+20,(int)box.y+470, uiFont(11), Color{255,100,100,255});
     }
 }
 
@@ -3505,6 +3582,7 @@ int main(int argc, char** argv) {
                 }
                 if (IsKeyPressed(KEY_ENTER) && st.modal==Modal::Command) { if(!st.commandEdit.empty()){ if(st.vfs && st.vfs->isLocal() && spawnShellInDir(st.path,st.commandEdit,true)) st.status="Command started"; else st.status="Command requires a local filesystem directory"; st.modal=Modal::None; unfocus(st); } }
                 if (IsKeyPressed(KEY_ENTER) && st.modal==Modal::Rename) applyRename(st);
+                if (st.modal==Modal::Properties && st.focusedField==TextField::XdgMimeDesktop && IsKeyPressed(KEY_ENTER)) { applyXdgMimeDefault(st); unfocus(st); }
                 if (st.modal==Modal::Properties && st.focusedField==TextField::Mode && IsKeyPressed(KEY_ENTER)) { modeToBits(st.props); unfocus(st); }
             }
         }
@@ -3871,18 +3949,19 @@ int main(int argc, char** argv) {
             else if(pointIn(cancel,mouse)){ st.modal=Modal::None; unfocus(st); }
         }
         if(st.modal==Modal::Properties && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            Rectangle box{W*0.5f-290,H*0.5f-220,580,440};
-            if (st.props.multi) {
-                Rectangle closeR{box.x+440, box.y+210, 70, 32};
-                if (pointIn(closeR, mouse)) { st.modal=Modal::None; unfocus(st); }
+            const PropertiesLayout pu=propertiesLayout(W,H,st.props.multi);
+            if(st.props.multi) {
+                if(pointIn(pu.close,mouse)) { st.modal=Modal::None; unfocus(st); }
             } else {
-            // Mode editor field
-            Rectangle modeR{box.x+68,box.y+217,90,31};
-            if(pointIn(modeR,mouse)) focus(st,TextField::Mode,false);
-            for(int c=0;c<3;++c)for(int r=0;r<3;++r){Rectangle cb{box.x+25+c*170+r*44,box.y+290,16,16};if(pointIn(cb,mouse)){modeToBits(st.props);toggleModeBit(st.props,c,r);}}
-            Rectangle saveR{box.x+440,box.y+364,70,32}, cancelR{box.x+515,box.y+364,45,32};
-            if(pointIn(saveR,mouse)) { saveProperties(st); }
-            if(pointIn(cancelR,mouse)) { st.modal=Modal::None; unfocus(st); }
+                if(pointIn(pu.mime,mouse)) focusAt(st,TextField::XdgMimeDesktop,mouse.x,pu.mime.x+8,13);
+                else if(pointIn(pu.mimeApply,mouse)) { applyXdgMimeDefault(st); unfocus(st); }
+                else if(pointIn(pu.mode,mouse)) focusAt(st,TextField::Mode,mouse.x,pu.mode.x+8,14);
+                else {
+                    bool handled=false;
+                    for(int c=0;c<3 && !handled;++c) for(int r=0;r<3;++r){ Rectangle cb{pu.box.x+25+c*170+r*44,pu.box.y+385,16,16}; if(pointIn(cb,mouse)){ modeToBits(st.props); toggleModeBit(st.props,c,r); handled=true; break; } }
+                    if(!handled && pointIn(pu.save,mouse)) saveProperties(st);
+                    else if(!handled && pointIn(pu.close,mouse)) { st.modal=Modal::None; unfocus(st); }
+                }
             }
         }
         if(st.modal==Modal::NewItem && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
