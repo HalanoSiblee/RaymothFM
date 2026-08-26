@@ -25,6 +25,7 @@ Next-Gen linux file manager Speed focused ⚡
 - No bloatware to slow start up open in no time.
 - XDG integration
 - Progressive rendering
+- MIME EDITOR
 
 # Dependency
 
