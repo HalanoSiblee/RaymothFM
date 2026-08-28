@@ -339,6 +339,66 @@ static Color colorHex(unsigned int rgb, unsigned char a = 255) {
 static float gUIFontScale = 1.15f;
 static inline int uiFont(int base) { return std::max(1, (int)std::lround(base * gUIFontScale)); }
 
+
+// Lightweight GPU-rendered mouse laser. No per-frame allocations: fixed ring buffer.
+struct MouseTrailPoint { Vector2 pos{}; double time = 0.0; };
+struct MouseLaserTrail {
+    static constexpr size_t Capacity = 40;
+    std::array<MouseTrailPoint, Capacity> points{};
+    size_t head = 0;
+    size_t count = 0;
+    Vector2 last{0, 0};
+    bool initialized = false;
+
+    void update(Vector2 p, double now) {
+        if (!initialized) {
+            initialized = true;
+            last = p;
+            points[0] = {p, now};
+            head = 0;
+            count = 1;
+            return;
+        }
+        const float dx = p.x - last.x;
+        const float dy = p.y - last.y;
+        if (dx * dx + dy * dy < 0.25f) return;
+        head = (head + 1) % Capacity;
+        points[head] = {p, now};
+        if (count < Capacity) ++count;
+        last = p;
+    }
+
+    bool active(double now) const {
+        if (!count) return false;
+        const double lifetime = 0.22;
+        const double newestAge = now - points[head].time;
+        return newestAge < lifetime;
+    }
+
+    void draw(Color accent, double now, float beamSize, bool enabled) const {
+        if (!enabled || !count) return;
+        BeginBlendMode(BLEND_ADDITIVE);
+        const double lifetime = 0.22;
+        const float size = std::clamp(beamSize / 0.1f, 0.1f, 20.0f);
+        for (size_t i = 0; i + 1 < count; ++i) {
+            const size_t a = (head + Capacity - i) % Capacity;
+            const size_t b = (head + Capacity - i - 1) % Capacity;
+            const double ageA = now - points[a].time;
+            const double ageB = now - points[b].time;
+            if (ageA > lifetime) break;
+            const float fade = (float)std::clamp(1.0 - ageA / lifetime, 0.0, 1.0);
+            const float width = (1.5f + 7.0f * fade) * size;
+            DrawLineEx(points[a].pos, points[b].pos, width, Fade(accent, 0.10f * fade));
+            DrawLineEx(points[a].pos, points[b].pos, std::max(1.0f, width * 0.32f), Fade(accent, 0.55f * fade));
+        }
+        const Vector2 tip = points[head].pos;
+        DrawCircleV(tip, 12.0f * size, Fade(accent, 0.035f));
+        DrawCircleV(tip, 6.0f * size, Fade(accent, 0.10f));
+        DrawCircleV(tip, 2.2f * size, Fade(accent, 0.95f));
+        EndBlendMode();
+    }
+};
+
 struct Theme {
     const char* name;
     Color bg;
@@ -351,7 +411,7 @@ struct Theme {
     Color accent;
 };
 
-static const std::array<Theme, 11> kThemes = {{
+static std::array<Theme, 12> kThemes = {{
     {"OLED Black & White", colorHex(0x000000), colorHex(0x000000), colorHex(0x000000), colorHex(0xffffff), colorHex(0xc8c8c8), colorHex(0x303030), colorHex(0x111111), colorHex(0xffffff)},
     {"Midnight",  colorHex(0x050912), colorHex(0x0d1420), colorHex(0x151f2e), colorHex(0xf4f7fb), colorHex(0x8ca1bc), colorHex(0x263448), colorHex(0x122236), colorHex(0x5ca9ff)},
     {"Carbon",    colorHex(0x0a0a0a), colorHex(0x111111), colorHex(0x1b1b1b), colorHex(0xf2f2f2), colorHex(0x969696), colorHex(0x303030), colorHex(0x1c1c1c), colorHex(0xffa640)},
@@ -362,7 +422,8 @@ static const std::array<Theme, 11> kThemes = {{
     {"Amber",     colorHex(0x0b0802), colorHex(0x171107), colorHex(0x241a0b), colorHex(0xfff8e9), colorHex(0xb0a17f), colorHex(0x4a3b20), colorHex(0x2c210e), colorHex(0xffc857)},
     {"Steel",     colorHex(0x06080a), colorHex(0x101418), colorHex(0x181e23), colorHex(0xf0f4f7), colorHex(0x8e9aa2), colorHex(0x2a343c), colorHex(0x1a242a), colorHex(0x7bd7ff)},
     {"Lime",      colorHex(0x050805), colorHex(0x0b120b), colorHex(0x152015), colorHex(0xf3fff0), colorHex(0x93aa8e), colorHex(0x2b4328), colorHex(0x122612), colorHex(0xb5ff53)},
-    {"Paper White",colorHex(0xffffff), colorHex(0xffffff), colorHex(0xf3f3f3), colorHex(0x101010), colorHex(0x555555), colorHex(0xc8c8c8), colorHex(0xe8e8e8), colorHex(0x0078d4)}
+    {"Paper White",colorHex(0xffffff), colorHex(0xffffff), colorHex(0xf3f3f3), colorHex(0x101010), colorHex(0x555555), colorHex(0xc8c8c8), colorHex(0xe8e8e8), colorHex(0x0078d4)},
+    {"Custom (systemtheme)", colorHex(0x000000), colorHex(0x000000), colorHex(0x000000), colorHex(0xffffff), colorHex(0xc8c8c8), colorHex(0x303030), colorHex(0x111111), colorHex(0xffffff)}
 }};
 
 struct Config {
@@ -373,6 +434,12 @@ struct Config {
     bool showThumbnails = true;
     int thumbnailRes = 3; // 1=32, 2=64, 3=128, 4=256, 5=512
     float fontScale = 1.15f;
+    bool cursorBeam = true;
+    float beamSize = 0.1f; // 0.1 = current/default beam size
+    std::array<Color, 8> systemTheme{{
+        colorHex(0x000000), colorHex(0x000000), colorHex(0x000000), colorHex(0xffffff),
+        colorHex(0xc8c8c8), colorHex(0x303030), colorHex(0x111111), colorHex(0xffffff)
+    }}; // bg,panel,panel2,text,muted,line,hover,accent
     std::string editor;
     std::string term = "foot";
     std::vector<std::string> favorites;
@@ -448,6 +515,32 @@ static Color accentFromHSVField(const std::string& text, Color fallback) {
     return colorHex(rgb);
 }
 
+static bool parseSystemTheme(const std::string& text, std::array<Color, 8>& out) {
+    std::stringstream ss(text);
+    std::string token;
+    std::array<Color, 8> parsed{};
+    int i = 0;
+    while (std::getline(ss, token, ',') && i < (int)parsed.size()) {
+        const unsigned int rgb = parseHexRGB(token, 0xffffffffu);
+        if (rgb == 0xffffffffu && lowerCopy(token) != "#ffffff" && lowerCopy(token) != "ffffff") return false;
+        parsed[(size_t)i++] = colorHex(rgb);
+    }
+    if (i != (int)parsed.size()) return false;
+    out = parsed;
+    return true;
+}
+
+static void applySystemTheme(const std::array<Color, 8>& colors) {
+    kThemes[11].bg = colors[0];
+    kThemes[11].panel = colors[1];
+    kThemes[11].panel2 = colors[2];
+    kThemes[11].text = colors[3];
+    kThemes[11].muted = colors[4];
+    kThemes[11].line = colors[5];
+    kThemes[11].hover = colors[6];
+    kThemes[11].accent = colors[7];
+}
+
 static Config loadConfig() {
     Config c;
     c.dir = configBase() / "raymothfm";
@@ -472,6 +565,9 @@ static Config loadConfig() {
         else if (key == "show_thumbnails") c.showThumbnails = std::atoi(value.c_str()) != 0;
         else if (key == "thumbnail_res") c.thumbnailRes = std::clamp(std::atoi(value.c_str()), 1, 5);
         else if (key == "font_scale") c.fontScale = std::clamp(std::strtof(value.c_str(), nullptr), 1.0f, 2.5f);
+        else if (key == "cursorbeam") c.cursorBeam = std::atoi(value.c_str()) != 0;
+        else if (key == "beamsize") c.beamSize = std::clamp(std::strtof(value.c_str(), nullptr), 0.01f, 2.0f);
+        else if (key == "systemtheme" || key == "SYSTEMTHEME") parseSystemTheme(value, c.systemTheme);
         else if (key == "editor" || key == "EDITOR") { c.editor = value; if(c.editor.size()>=2 && c.editor.front()=='"' && c.editor.back()=='"') c.editor=c.editor.substr(1,c.editor.size()-2); }
         else if (key == "term" || key == "TERM") { c.term = value; if(c.term.size()>=2 && c.term.front()=='"' && c.term.back()=='"') c.term=c.term.substr(1,c.term.size()-2); }
         else if (key == "favorite" && !value.empty()) c.favorites.push_back(value);
@@ -487,6 +583,7 @@ static Config loadConfig() {
         }
         c.favorites.push_back(homeDir().string());
     }
+    applySystemTheme(c.systemTheme);
     return c;
 }
 
@@ -502,6 +599,14 @@ static void saveConfig(const Config& c, bool allowCreate = false) {
     out << "show_thumbnails=" << (c.showThumbnails ? 1 : 0) << "\n";
     out << "thumbnail_res=" << c.thumbnailRes << "\n";
     out << "font_scale=" << c.fontScale << "\n";
+    out << "cursorbeam=" << (c.cursorBeam ? 1 : 0) << "\n";
+    out << "beamsize=" << c.beamSize << "\n";
+    out << "systemtheme=";
+    for (size_t i = 0; i < c.systemTheme.size(); ++i) {
+        if (i) out << ",";
+        out << hexRGB(c.systemTheme[i]);
+    }
+    out << "\n";
     out << "EDITOR=\"" << c.editor << "\"\n";
     out << "TERM=\"" << c.term << "\"\n";
     for (const auto& f : c.favorites) out << "favorite=" << f << "\n";
@@ -521,6 +626,10 @@ static bool writeTemplateConfig() {
     c.editor = "";
     c.term = "foot";
     c.fontScale = 1.15f;
+    c.cursorBeam = true;
+    c.beamSize = 0.1f;
+    c.systemTheme = Config{}.systemTheme;
+    applySystemTheme(c.systemTheme);
     c.favorites.clear();
     saveConfig(c, true);
     std::printf("raymothfm: created default config: %s\n", c.file.c_str());
@@ -678,10 +787,11 @@ struct PackedUiFlags {
     uint32_t convertLossless:1;
     uint32_t convertStrip:1;
     uint32_t convertOutputAuto:1;
-    uint32_t reserved:20;
+    uint32_t cursorBeam:1;
+    uint32_t reserved:19;
     PackedUiFlags() : sidebar(1), newItemDirectory(1), sortAscending(1), configDirty(0), checksumBusy(0),
         archiveTemplateAuto(1), imageFit(1), imageDragging(0), pendingPasteCut(0), convertLossless(0),
-        convertStrip(0), convertOutputAuto(1), reserved(0) {}
+        convertStrip(0), convertOutputAuto(1), cursorBeam(1), reserved(0) {}
 };
 
 static_assert(sizeof(PackedUiFlags) == sizeof(uint32_t), "PackedUiFlags must remain one 32-bit word");
@@ -2700,7 +2810,7 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
                 EndScissorMode();
             }
         };
-        field({box.x+20,box.y+92,150,34},"Theme number (0-10)",TextField::ThemeNumber,s.themeEdit);
+        field({box.x+20,box.y+92,150,34},"Theme number (0-11)",TextField::ThemeNumber,s.themeEdit);
         field({box.x+20,box.y+152,270,34},"EDITOR",TextField::EditorConfig,s.editorEdit);
         field({box.x+20,box.y+212,270,34},"TERM",TextField::TermConfig,s.termEdit);
         field({box.x+20,box.y+272,170,34},"Font scale (1.0-2.5)",TextField::FontScale,s.fontScaleEdit);
@@ -2719,7 +2829,7 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
         DrawText("Navigation",(int)box.x+20,(int)box.y+58, uiFont(15), t.accent);
         const char* lines[] = {
             "/                 Focus path (keep text)", "Ctrl+/             Clear + focus path", "Ctrl+L             Focus/select path", "Tab                Complete path/command", "Enter              Open / activate", "Arrow keys         Navigate selection", "PageUp/PageDown    Page through items", "Backspace          Parent directory", "Alt+Left/Right     History", "Ctrl+T/W/Tab        New/close/switch tab",
-            "Ctrl+1..9          Switch tab", "Ctrl+F             Focus search", "Ctrl+H             Show/hide hidden files", "Ctrl+A             Select all", "Ctrl+C/X/V         Copy/cut/paste", "Delete / Shift+Del Trash / permanent delete", "F2                 Rename", "F7 / Ctrl+Shift+N   New directory", "Ctrl+Alt+N          New file", "F6                 cat / text viewer", "F8                 Copy current directory path", "F9                 Open terminal here", "Ctrl+Home          Jump to Home", "A-Z                Focus search and start typing", "Ctrl+Shift+A        Compress", "X                  Extract selected archive", "Ctrl+Wheel          Change view zoom", "1..4               Details/List/Medium/Large", "F3                 Theme picker (0..10)", "`                  Run command here", "Tab                Path/command completion", "F1                 This help", "F4                About", "Config: show_thumbnails=1 + thumbnail_res=1..5 (32/64/128/256/512px); thumbnails use a visible-set-aware bounded cache (96 medium / 48 large).", "Ctrl+Q             Quit", "Esc                Close active window/menu"
+            "Ctrl+1..9          Switch tab", "Ctrl+F             Focus search", "Ctrl+H             Show/hide hidden files", "Ctrl+A             Select all", "Ctrl+C/X/V         Copy/cut/paste", "Delete / Shift+Del Trash / permanent delete", "F2                 Rename", "F7 / Ctrl+Shift+N   New directory", "Ctrl+Alt+N          New file", "F6                 cat / text viewer", "F8                 Copy current directory path", "F9                 Open terminal here", "Ctrl+Home          Jump to Home", "A-Z                Focus search and start typing", "Ctrl+Shift+A        Compress", "X                  Extract selected archive", "Ctrl+Wheel          Change view zoom", "1..4               Details/List/Medium/Large", "F3                 Theme picker (0..11)", "`                  Run command here", "Tab                Path/command completion", "F1                 This help", "F4                About", "Config: show_thumbnails=1 + thumbnail_res=1..5 (32/64/128/256/512px); thumbnails use a visible-set-aware bounded cache (96 medium / 48 large).", "Ctrl+Q             Quit", "Esc                Close active window/menu"
         };
         int y=(int)box.y+86; for(const char* line:lines){ DrawText(line,(int)box.x+20,y, uiFont(12), t.text); y+=14; if(y>box.y+392) break; }
         DrawText("Details view always shows Name, Date modified, Type and Size.",(int)box.x+20,(int)box.y+402, uiFont(12), t.muted);
@@ -3342,29 +3452,21 @@ int main(int argc, char** argv) {
     InitWindow(1360,780,"Win7RayExplorer / raymothfm");
     SetExitKey(KEY_NULL);
     SetTargetFPS(60);
-    BeginDrawing();
-    ClearBackground(BLACK);
-    DrawText("Starting raymothfm...", 24, 24, 20, WHITE);
-    DrawText("Initializing image/archive services...", 24, 54, 14, Color{170,170,170,255});
-    EndDrawing();
+    // Keep the native raylib cursor when the custom beam is disabled.
 
-    if (vips_init("raymothfm") != 0) return 1;
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    // Thumbnail jobs run off the UI thread. Keep libvips worker width bounded to
-    // avoid oversubscribing the machine when two decode jobs are active.
-    vips_concurrency_set((int)std::clamp(hw >= 4 ? 2u : 1u, 1u, 2u));
-    // We process many distinct images, so the libvips operation cache is not useful
-    // for the proxy/thumbnail workload and can retain unnecessary state.
-    vips_cache_set_max(0);
     ThumbnailWorker thumbnailWorker;
-    thumbnailWorker.start(hw >= 4 ? 2 : 1);
-    gThumbnailWorker = &thumbnailWorker;
-
+    bool thumbnailServicesReady = false;
+    bool vipsReady = false;
+    MouseLaserTrail mouseLaser;
     EnableEventWaiting();
 
     ExplorerState st;
     st.config=loadConfig();
     st.config.fontScale = std::clamp(st.config.fontScale, 1.0f, 2.5f);
+    st.config.beamSize = std::clamp(st.config.beamSize, 0.01f, 2.0f);
+    st.flags.cursorBeam = st.config.cursorBeam;
+    if (st.flags.cursorBeam) HideCursor(); else ShowCursor();
     gUIFontScale = st.config.fontScale;
     st.config.accent = st.config.accent.a == 0 ? kThemes[st.config.theme].accent : st.config.accent;
 
@@ -3383,9 +3485,11 @@ int main(int argc, char** argv) {
              IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN) ||
              IsKeyDown(KEY_HOME) || IsKeyDown(KEY_END));
         const bool thumbBusy = thumbnailWorker.hasPendingWork();
-        if (thumbBusy || navigationHeld) {
+        const double frameNow = GetTime();
+        const bool mouseBeamAnimating = st.flags.cursorBeam && mouseLaser.active(frameNow);
+        if (thumbBusy || navigationHeld || mouseBeamAnimating) {
             DisableEventWaiting();
-            if (thumbBusy && !navigationHeld) WaitTime(0.004);
+            if (thumbBusy && !navigationHeld && !mouseBeamAnimating) WaitTime(0.004);
         } else EnableEventWaiting();
         if (WindowShouldClose()) break;
         if (isCtrlDown() && IsKeyPressed(KEY_Q)) break;
@@ -3398,6 +3502,13 @@ int main(int argc, char** argv) {
         const Theme& baseTheme=kThemes[std::clamp(st.config.theme,0,(int)kThemes.size()-1)];
         Theme t=baseTheme; t.accent=st.config.accent;
         const Vector2 mouse=GetMousePosition();
+        const double mouseNow = GetTime();
+        mouseLaser.update(mouse, mouseNow);
+        if (st.flags.cursorBeam && (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
+                                     IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) ||
+                                     IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE))) {
+            DisableEventWaiting();
+        }
 
         // Global hotkeys that should work outside text editors.
         if (st.modal==Modal::None) {
@@ -3577,7 +3688,7 @@ int main(int argc, char** argv) {
                 }
                 if (IsKeyPressed(KEY_ENTER) && st.modal==Modal::ThemePicker) {
                     const int n=std::atoi(st.themeEdit.c_str());
-                    if(n>=0 && n<(int)kThemes.size()) { st.config.theme=n; if(!st.config.accentCustom) st.config.accent=kThemes[n].accent; st.flags.configDirty=true; st.status="Theme "+std::to_string(n)+": "+kThemes[n].name; st.modal=Modal::None; unfocus(st); }
+                    if(n>=0 && n<(int)kThemes.size()) { st.config.theme=n; applySystemTheme(st.config.systemTheme); if(!st.config.accentCustom) st.config.accent=kThemes[n].accent; st.flags.configDirty=true; st.status="Theme "+std::to_string(n)+": "+kThemes[n].name; st.modal=Modal::None; unfocus(st); }
                     else st.modalError="Theme must be a number from 0 to "+std::to_string((int)kThemes.size()-1);
                 }
                 if (IsKeyPressed(KEY_ENTER) && st.modal==Modal::Command) { if(!st.commandEdit.empty()){ if(st.vfs && st.vfs->isLocal() && spawnShellInDir(st.path,st.commandEdit,true)) st.status="Command started"; else st.status="Command requires a local filesystem directory"; st.modal=Modal::None; unfocus(st); } }
@@ -3736,7 +3847,25 @@ int main(int argc, char** argv) {
 
         if(st.menu.open)drawContextMenu(st,t,W,H);
         if(st.modal!=Modal::None)drawModal(st,W,H,t);
+        mouseLaser.draw(t.accent, GetTime(), st.config.beamSize, st.flags.cursorBeam);
         EndDrawing();
+
+        // Bring expensive image services online only after the first complete UI frame
+        // is visible. The window therefore appears immediately instead of showing a
+        // loading screen while libvips initializes.
+        if (!thumbnailServicesReady) {
+            if (vips_init("raymothfm") == 0) {
+                vips_concurrency_set((int)std::clamp(hw >= 4 ? 2u : 1u, 1u, 2u));
+                vips_cache_set_max(0);
+                thumbnailWorker.start(hw >= 4 ? 2 : 1);
+                gThumbnailWorker = &thumbnailWorker;
+                vipsReady = true;
+                thumbnailServicesReady = true;
+            } else {
+                st.status = "libvips initialization failed; image services unavailable";
+                thumbnailServicesReady = true;
+            }
+        }
 
         // ------------------------------------------------------------------
         // Mouse input
@@ -3902,11 +4031,11 @@ int main(int argc, char** argv) {
             else if(pointIn(accentF,mouse)) focusAt(st,TextField::AccentConfig,mouse.x,accentF.x+8,13);
             else if(pointIn(hsvBtn,mouse)){ st.config.accent=ColorFromHSV(std::fmod((float)(GetTime()*53.0),360.0f),0.72f,0.96f); st.config.accentCustom=true; st.accentEdit=hexRGB(st.config.accent); st.flags.configDirty=true; }
             else if(pointIn(apply,mouse)) {
-                int n=std::atoi(st.themeEdit.c_str()); if(n>=0&&n<(int)kThemes.size()) st.config.theme=n;
+                int n=std::atoi(st.themeEdit.c_str()); if(n>=0&&n<(int)kThemes.size()) { st.config.theme=n; applySystemTheme(st.config.systemTheme); }
                 st.config.editor=st.editorEdit; st.config.term=st.termEdit; st.config.fontScale=std::clamp(std::strtof(st.fontScaleEdit.c_str(),nullptr),1.0f,2.5f); gUIFontScale=st.config.fontScale;
                 st.config.accent=accentFromHSVField(st.accentEdit, st.config.accent); st.config.accentCustom=true; st.flags.configDirty=true; st.modal=Modal::None; unfocus(st);
             } else if(pointIn(cancel,mouse)){ st.modal=Modal::None; unfocus(st); }
-            else { int yy=(int)box.y+100; for(int i=0;i<(int)kThemes.size();++i){ Rectangle r{box.x+330,(float)yy-3,230,18}; if(pointIn(r,mouse)){ st.themeEdit=std::to_string(i); st.config.theme=i; if(!st.config.accentCustom) st.config.accent=kThemes[i].accent; st.flags.configDirty=true; } yy+=17; } }
+            else { int yy=(int)box.y+100; for(int i=0;i<(int)kThemes.size();++i){ Rectangle r{box.x+330,(float)yy-3,230,18}; if(pointIn(r,mouse)){ st.themeEdit=std::to_string(i); st.config.theme=i; applySystemTheme(st.config.systemTheme); if(!st.config.accentCustom) st.config.accent=kThemes[i].accent; st.flags.configDirty=true; } yy+=17; } }
         }
         if(st.modal==Modal::DiskInfo && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
             Rectangle box{W*0.5f-290,H*0.5f-220,580,440}; const int n=(int)st.diskInfo.mounts.size();
@@ -3985,7 +4114,7 @@ int main(int argc, char** argv) {
     if(st.imageTexture.id) UnloadTexture(st.imageTexture);
     thumbnailWorker.stop();
     gThumbnailWorker = nullptr;
-    vips_shutdown();
+    if (vipsReady) vips_shutdown();
     CloseWindow();
     return 0;
 }
