@@ -4,58 +4,16 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'code/**'
-      - 'Makefile'
-      - 'VERSION'
-      - 'rayicons.h'
-      - '.github/workflows/ubuntu-qa.yml'
-
   pull_request:
-
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build on Ubuntu ${{ matrix.ubuntu }}
-    runs-on: ubuntu-${{ matrix.ubuntu }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        ubuntu:
-          - '22.04'
-          - '24.04'
+    runs-on: ubuntu-22.04
 
     steps:
-
-      # ==========================================
-      # Checkout
-      # ==========================================
-
       - name: Checkout
         uses: actions/checkout@v4
-
-      # ==========================================
-      # System information
-      # ==========================================
-
-      - name: System information
-        run: |
-          echo "=== Ubuntu ==="
-          cat /etc/os-release
-
-          echo
-          echo "=== Kernel ==="
-          uname -a
-
-          echo
-          echo "=== Compiler ==="
-          g++ --version
-
-      # ==========================================
-      # Dependencies
-      # ==========================================
 
       - name: Install dependencies
         run: |
@@ -63,22 +21,52 @@ jobs:
 
           sudo apt-get install -y \
             build-essential \
+            cmake \
             pkg-config \
-            libraylib-dev \
             libarchive-dev \
             libmagic-dev \
             libvips-dev \
             libssl-dev \
             zlib1g-dev \
             libx11-dev \
+            libglfw3-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev \
             xdg-utils \
             p7zip-full \
             zstd \
             xz-utils
 
-      # ==========================================
-      # Verify pkg-config dependencies
-      # ==========================================
+      - name: Build Raylib
+        run: |
+          set -e
+
+          git clone --depth 1 \
+            https://github.com/raysan5/raylib.git \
+            /tmp/raylib
+
+          cmake \
+            -S /tmp/raylib \
+            -B /tmp/raylib/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_EXAMPLES=OFF
+
+          cmake \
+            --build /tmp/raylib/build \
+            --parallel "$(nproc)"
+
+          sudo cmake \
+            --install /tmp/raylib/build
+
+          sudo ldconfig
+
+      - name: Verify Raylib
+        run: |
+          set -e
+          pkg-config --exists raylib
+          pkg-config --modversion raylib
 
       - name: Verify dependencies
         run: |
@@ -93,38 +81,26 @@ jobs:
             zlib
           do
             echo "Checking $pkg..."
+            pkg-config --exists "$pkg"
             pkg-config --modversion "$pkg"
           done
 
-      # ==========================================
-      # Build
-      # ==========================================
-
       - name: Build RayMothFM
         run: |
+          set -e
+
           make clean || true
           make -j"$(nproc)"
 
-      # ==========================================
-      # Basic binary checks
-      # ==========================================
-
-      - name: Check binary
+      - name: Validate binary
         run: |
           set -e
 
           test -x ./raymothfm
 
-          echo "=== File ==="
           file ./raymothfm
 
-          echo
-          echo "=== Version ==="
           ./raymothfm --help
-
-      # ==========================================
-      # Config generation test
-      # ==========================================
 
       - name: Test config generation
         run: |
@@ -134,48 +110,41 @@ jobs:
 
           test -f "$HOME/.config/raymothfm/config"
 
-          echo "Config generated successfully:"
-          cat "$HOME/.config/raymothfm/config"
-
-      # ==========================================
-      # Dynamic dependencies
-      # ==========================================
-
-      - name: Check linked libraries
+      - name: Check runtime libraries
         run: |
           set -e
 
-          echo "=== ldd ==="
           ldd ./raymothfm
-
-          echo
-          echo "Checking for missing libraries..."
 
           if ldd ./raymothfm | grep -q "not found"; then
             echo "ERROR: Missing runtime libraries"
             exit 1
           fi
 
-      # ==========================================
-      # Archive tool checks
-      # ==========================================
-
-      - name: Check archive tools
+      - name: Test external tools
         run: |
           set -e
 
-          7z
+          7z -h >/dev/null
           zstd --version
           xz --version
 
-      # ==========================================
-      # Artifact
-      # ==========================================
+      - name: Installation test
+        run: |
+          set -e
 
-      - name: Upload binary
+          sudo install \
+            -Dm755 \
+            ./raymothfm \
+            /usr/local/bin/raymothfm
+
+          command -v raymothfm
+          raymothfm --help
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: raymothfm-ubuntu-${{ matrix.ubuntu }}
+          name: raymothfm-ubuntu-22.04
           path: |
             raymothfm
             VERSION
