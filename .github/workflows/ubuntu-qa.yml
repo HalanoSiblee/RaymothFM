@@ -4,19 +4,55 @@ on:
   push:
     branches:
       - main
+
   pull_request:
+
   workflow_dispatch:
 
 jobs:
   build:
+    name: Build RayMothFM on Ubuntu 22.04
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout
+
+      # ==========================================
+      # Checkout
+      # ==========================================
+
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      # ==========================================
+      # System information
+      # ==========================================
+
+      - name: System information
+        run: |
+          set -e
+
+          echo "======================================"
+          echo " RayMothFM Ubuntu QA"
+          echo "======================================"
+
+          cat /etc/os-release
+
+          echo
+          echo "Kernel:"
+          uname -a
+
+          echo
+          echo "Compiler:"
+          g++ --version
+
+      # ==========================================
+      # Dependencies
+      # ==========================================
 
       - name: Install dependencies
         run: |
+          set -e
+
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -39,11 +75,16 @@ jobs:
             zstd \
             xz-utils
 
+      # ==========================================
+      # Build Raylib
+      # ==========================================
+
       - name: Build Raylib
         run: |
           set -e
 
-          git clone --depth 1 \
+          git clone \
+            --depth 1 \
             https://github.com/raysan5/raylib.git \
             /tmp/raylib
 
@@ -62,11 +103,24 @@ jobs:
 
           sudo ldconfig
 
+      # ==========================================
+      # Verify Raylib
+      # ==========================================
+
       - name: Verify Raylib
         run: |
           set -e
-          pkg-config --exists raylib
+
+          echo "Raylib version:"
           pkg-config --modversion raylib
+
+          echo
+          echo "Raylib flags:"
+          pkg-config --cflags --libs raylib
+
+      # ==========================================
+      # Verify dependencies
+      # ==========================================
 
       - name: Verify dependencies
         run: |
@@ -85,43 +139,85 @@ jobs:
             pkg-config --modversion "$pkg"
           done
 
+      # ==========================================
+      # Build RayMothFM
+      # ==========================================
+
       - name: Build RayMothFM
+        working-directory: code
         run: |
           set -e
 
           make clean || true
           make -j"$(nproc)"
 
+      # ==========================================
+      # Validate binary
+      # ==========================================
+
       - name: Validate binary
         run: |
           set -e
 
-          test -x ./raymothfm
+          test -x ./code/raymothfm
 
-          file ./raymothfm
+          echo "=== Binary ==="
+          file ./code/raymothfm
 
-          ./raymothfm --help
+          echo
+          echo "=== Size ==="
+          ls -lh ./code/raymothfm
 
-      - name: Test config generation
+      # ==========================================
+      # CLI smoke test
+      # ==========================================
+
+      - name: CLI smoke test
         run: |
           set -e
 
-          ./raymothfm --mkcfg
+          ./code/raymothfm --help
+
+      # ==========================================
+      # Config generation
+      # ==========================================
+
+      - name: Config generation test
+        run: |
+          set -e
+
+          ./code/raymothfm --mkcfg
 
           test -f "$HOME/.config/raymothfm/config"
+
+          echo "Config generated successfully:"
+          cat "$HOME/.config/raymothfm/config"
+
+      # ==========================================
+      # Runtime library check
+      # ==========================================
 
       - name: Check runtime libraries
         run: |
           set -e
 
-          ldd ./raymothfm
+          echo "=== Linked libraries ==="
 
-          if ldd ./raymothfm | grep -q "not found"; then
-            echo "ERROR: Missing runtime libraries"
+          ldd ./code/raymothfm
+
+          echo
+          echo "=== Checking missing libraries ==="
+
+          if ldd ./code/raymothfm | grep -q "not found"; then
+            echo "ERROR: Missing runtime library"
             exit 1
           fi
 
-      - name: Test external tools
+      # ==========================================
+      # External tools
+      # ==========================================
+
+      - name: Check external tools
         run: |
           set -e
 
@@ -129,22 +225,31 @@ jobs:
           zstd --version
           xz --version
 
+      # ==========================================
+      # Installation test
+      # ==========================================
+
       - name: Installation test
         run: |
           set -e
 
           sudo install \
             -Dm755 \
-            ./raymothfm \
+            ./code/raymothfm \
             /usr/local/bin/raymothfm
 
           command -v raymothfm
+
           raymothfm --help
 
-      - name: Upload artifact
+      # ==========================================
+      # Upload artifact
+      # ==========================================
+
+      - name: Upload RayMothFM
         uses: actions/upload-artifact@v4
         with:
           name: raymothfm-ubuntu-22.04
           path: |
-            raymothfm
-            VERSION
+            code/raymothfm
+            code/VERSION
