@@ -1,0 +1,255 @@
+name: Ubuntu QA
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build RayMothFM on Ubuntu 22.04
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      # ==========================================
+      # Checkout
+      # ==========================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # System information
+      # ==========================================
+
+      - name: System information
+        run: |
+          set -e
+
+          echo "======================================"
+          echo " RayMothFM Ubuntu QA"
+          echo "======================================"
+
+          cat /etc/os-release
+
+          echo
+          echo "Kernel:"
+          uname -a
+
+          echo
+          echo "Compiler:"
+          g++ --version
+
+      # ==========================================
+      # Dependencies
+      # ==========================================
+
+      - name: Install dependencies
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            pkg-config \
+            libarchive-dev \
+            libmagic-dev \
+            libvips-dev \
+            libssl-dev \
+            zlib1g-dev \
+            libx11-dev \
+            libglfw3-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            xdg-utils \
+            p7zip-full \
+            zstd \
+            xz-utils
+
+      # ==========================================
+      # Build Raylib
+      # ==========================================
+
+      - name: Build Raylib
+        run: |
+          set -e
+
+          git clone \
+            --depth 1 \
+            https://github.com/raysan5/raylib.git \
+            /tmp/raylib
+
+          cmake \
+            -S /tmp/raylib \
+            -B /tmp/raylib/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_EXAMPLES=OFF
+
+          cmake \
+            --build /tmp/raylib/build \
+            --parallel "$(nproc)"
+
+          sudo cmake \
+            --install /tmp/raylib/build
+
+          sudo ldconfig
+
+      # ==========================================
+      # Verify Raylib
+      # ==========================================
+
+      - name: Verify Raylib
+        run: |
+          set -e
+
+          echo "Raylib version:"
+          pkg-config --modversion raylib
+
+          echo
+          echo "Raylib flags:"
+          pkg-config --cflags --libs raylib
+
+      # ==========================================
+      # Verify dependencies
+      # ==========================================
+
+      - name: Verify dependencies
+        run: |
+          set -e
+
+          for pkg in \
+            raylib \
+            libarchive \
+            libmagic \
+            vips \
+            openssl \
+            zlib
+          do
+            echo "Checking $pkg..."
+            pkg-config --exists "$pkg"
+            pkg-config --modversion "$pkg"
+          done
+
+      # ==========================================
+      # Build RayMothFM
+      # ==========================================
+
+      - name: Build RayMothFM
+        working-directory: code
+        run: |
+          set -e
+
+          make clean || true
+          make -j"$(nproc)"
+
+      # ==========================================
+      # Validate binary
+      # ==========================================
+
+      - name: Validate binary
+        run: |
+          set -e
+
+          test -x ./code/raymothfm
+
+          echo "=== Binary ==="
+          file ./code/raymothfm
+
+          echo
+          echo "=== Size ==="
+          ls -lh ./code/raymothfm
+
+      # ==========================================
+      # CLI smoke test
+      # ==========================================
+
+      - name: CLI smoke test
+        run: |
+          set -e
+
+          ./code/raymothfm --help
+
+      # ==========================================
+      # Config generation
+      # ==========================================
+
+      - name: Config generation test
+        run: |
+          set -e
+
+          ./code/raymothfm --mkcfg
+
+          test -f "$HOME/.config/raymothfm/config"
+
+          echo "Config generated successfully:"
+          cat "$HOME/.config/raymothfm/config"
+
+      # ==========================================
+      # Runtime library check
+      # ==========================================
+
+      - name: Check runtime libraries
+        run: |
+          set -e
+
+          echo "=== Linked libraries ==="
+
+          ldd ./code/raymothfm
+
+          echo
+          echo "=== Checking missing libraries ==="
+
+          if ldd ./code/raymothfm | grep -q "not found"; then
+            echo "ERROR: Missing runtime library"
+            exit 1
+          fi
+
+      # ==========================================
+      # External tools
+      # ==========================================
+
+      - name: Check external tools
+        run: |
+          set -e
+
+          7z -h >/dev/null
+          zstd --version
+          xz --version
+
+      # ==========================================
+      # Installation test
+      # ==========================================
+
+      - name: Installation test
+        run: |
+          set -e
+
+          sudo install \
+            -Dm755 \
+            ./code/raymothfm \
+            /usr/local/bin/raymothfm
+
+          command -v raymothfm
+
+          raymothfm --help
+
+      # ==========================================
+      # Upload artifact
+      # ==========================================
+
+      - name: Upload RayMothFM
+        uses: actions/upload-artifact@v4
+        with:
+          name: raymothfm-ubuntu-22.04
+          path: |
+            code/raymothfm
+            code/VERSION
