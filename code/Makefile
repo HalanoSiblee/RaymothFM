@@ -16,7 +16,7 @@ RAYLIB_LIBS := $(shell pkg-config --static --libs raylib 2>/dev/null)
 ifeq ($(WITH_VIPS),1)
 PKG_LIBS += $(shell pkg-config --libs vips 2>/dev/null)
 endif
-CPPFLAGS += $(PKG_CFLAGS) -DRAYMOTHFM_VERSION=\\\"$(VERSION)\\\"
+CPPFLAGS += $(PKG_CFLAGS) -DRAYMOTHFM_VERSION=\"$(VERSION)\"
 CXXFLAGS := -std=c++20 -O2 -flto -Wall -Wextra -Wpedantic
 LDFLAGS := -flto -s -Wl,--as-needed
 LDLIBS := $(RAYLIB_LIBS) $(PKG_LIBS) -lm -lpthread -ldl -lrt -lX11
