@@ -2,15 +2,17 @@
 #include <archive.h>
 #include <archive_entry.h>
 #include <magic.h>
+#ifdef RAYMOTHFM_WITH_VIPS
 #include <vips/vips.h>
+#endif
 #include <openssl/evp.h>
-#include <zlib.h>
 #include "rayicons.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <condition_variable>
 #include <deque>
 #include <cctype>
@@ -1807,6 +1809,7 @@ private:
             ThumbnailResult result;
             result.key = job.key;
 
+#ifdef RAYMOTHFM_WITH_VIPS
             VipsImage* img = nullptr;
             if (vips_thumbnail(job.path.c_str(), &img, job.maxSize, nullptr) == 0 && img) {
                 VipsImage* rgba = nullptr;
@@ -1833,6 +1836,28 @@ private:
                 if (rgba) g_object_unref(rgba);
                 g_object_unref(img);
             }
+#else
+            Image image = LoadImage(job.path.c_str());
+            if (image.data && image.width > 0 && image.height > 0) {
+                ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+                const int largest = std::max(image.width, image.height);
+                if (job.maxSize > 0 && largest > job.maxSize) {
+                    const float scale = (float)job.maxSize / (float)largest;
+                    const int width = std::max(1, (int)std::lround(image.width * scale));
+                    const int height = std::max(1, (int)std::lround(image.height * scale));
+                    ImageResize(&image, width, height);
+                }
+                if (image.data && image.width > 0 && image.height > 0) {
+                    const size_t bytes = (size_t)image.width * (size_t)image.height * 4u;
+                    const auto* pixels = static_cast<const unsigned char*>(image.data);
+                    result.width = image.width;
+                    result.height = image.height;
+                    result.pixels.assign(pixels, pixels + bytes);
+                    result.ok = !result.pixels.empty();
+                }
+                UnloadImage(image);
+            }
+#endif
 
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -1902,28 +1927,68 @@ static void pumpThumbnailResults(ExplorerState& s) {
     }
 }
 
-static bool vipsToTexture(VipsImage* img, Texture2D& out, int& w, int& h) {
-    if(!img) return false;
-    VipsImage* rgba=nullptr;
-    int bands=vips_image_get_bands(img);
-    if(bands==4) rgba=(VipsImage*)g_object_ref(img);
-    else if(bands==3) rgba=(VipsImage*)g_object_ref(img);
-    if(!rgba) return false;
-    VipsImage* alpha=nullptr;
-    if(vips_image_get_bands(rgba)==3) { if(vips_addalpha(rgba,&alpha,nullptr)==0) { g_object_unref(rgba); rgba=alpha; } }
-    size_t memSize=0; void* mem=vips_image_write_to_memory(rgba,&memSize);
-    if(!mem){ g_object_unref(rgba); return false; }
-    w=vips_image_get_width(rgba); h=vips_image_get_height(rgba);
-    Image im{}; im.data=mem; im.width=w; im.height=h; im.mipmaps=1; im.format=PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-    if(out.id) UnloadTexture(out);
-    out=LoadTextureFromImage(im);
-    g_free(mem); g_object_unref(rgba); return out.id!=0;
-}
-
-static bool loadVipsImageTexture(const std::string& path, int maxSize, Texture2D& out, int& w, int& h) {
-    VipsImage* img=nullptr;
-    if(vips_thumbnail(path.c_str(),&img,maxSize,nullptr)!=0) return false;
-    bool ok=vipsToTexture(img,out,w,h); g_object_unref(img); return ok;
+static bool loadImageTexture(const std::string& path, int maxSize, Texture2D& out, int& w, int& h) {
+#ifdef RAYMOTHFM_WITH_VIPS
+    VipsImage* img = nullptr;
+    if (vips_thumbnail(path.c_str(), &img, maxSize, nullptr) != 0 || !img) return false;
+    VipsImage* rgba = nullptr;
+    const int bands = vips_image_get_bands(img);
+    if (bands == 3 || bands == 4) rgba = (VipsImage*)g_object_ref(img);
+    if (rgba && vips_image_get_bands(rgba) == 3) {
+        VipsImage* alpha = nullptr;
+        if (vips_addalpha(rgba, &alpha, nullptr) == 0) {
+            g_object_unref(rgba);
+            rgba = alpha;
+        }
+    }
+    if (!rgba || vips_image_get_bands(rgba) != 4) {
+        if (rgba) g_object_unref(rgba);
+        g_object_unref(img);
+        return false;
+    }
+    size_t bytes = 0;
+    void* memory = vips_image_write_to_memory(rgba, &bytes);
+    if (!memory || bytes == 0) {
+        if (memory) g_free(memory);
+        g_object_unref(rgba);
+        g_object_unref(img);
+        return false;
+    }
+    w = vips_image_get_width(rgba);
+    h = vips_image_get_height(rgba);
+    Image image{};
+    image.data = memory;
+    image.width = w;
+    image.height = h;
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    if (out.id) UnloadTexture(out);
+    out = LoadTextureFromImage(image);
+    g_free(memory);
+    g_object_unref(rgba);
+    g_object_unref(img);
+    return out.id != 0;
+#else
+    Image image = LoadImage(path.c_str());
+    if (!image.data || image.width <= 0 || image.height <= 0) {
+        if (image.data) UnloadImage(image);
+        return false;
+    }
+    ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    const int largest = std::max(image.width, image.height);
+    if (maxSize > 0 && largest > maxSize) {
+        const float scale = (float)maxSize / (float)largest;
+        const int width = std::max(1, (int)std::lround(image.width * scale));
+        const int height = std::max(1, (int)std::lround(image.height * scale));
+        ImageResize(&image, width, height);
+    }
+    w = image.width;
+    h = image.height;
+    if (out.id) UnloadTexture(out);
+    out = LoadTextureFromImage(image);
+    UnloadImage(image);
+    return out.id != 0;
+#endif
 }
 
 static int configuredThumbnailSize(const Config& c) {
@@ -1960,7 +2025,7 @@ static void openImageViewer(ExplorerState& s) {
     s.flags.imageFit = true;
     s.imagePan = {0, 0};
     s.flags.imageDragging = false;
-    if(!loadVipsImageTexture(e.path,4096,s.imageTexture,s.imageW,s.imageH)){s.status="Cannot load image";return;}
+    if(!loadImageTexture(e.path,4096,s.imageTexture,s.imageW,s.imageH)){s.status="Cannot load image";return;}
     s.modal=Modal::ImageView; s.menu.open=false; unfocus(s);
 }
 
@@ -2455,19 +2520,36 @@ static void openInEditor(ExplorerState& s) {
 }
 
 
+static uint32_t crc32Chunk(uint32_t crc, const unsigned char* data, size_t size) {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> values{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t value = i;
+            for (int bit = 0; bit < 8; ++bit)
+                value = (value & 1u) ? (value >> 1) ^ 0xEDB88320u : (value >> 1);
+            values[i] = value;
+        }
+        return values;
+    }();
+    crc = ~crc;
+    for (size_t i = 0; i < size; ++i)
+        crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    return ~crc;
+}
+
 static bool computeChecksumFile(const fs::path& path, const char* algorithm, std::string& out, std::string& error) {
     std::ifstream in(path, std::ios::binary);
     if (!in) { error = "Unable to open file"; return false; }
     if (std::strcmp(algorithm, "crc32") == 0) {
-        uLong crc = ::crc32(0L, Z_NULL, 0);
-        std::array<char, 1024 * 1024> buf{};
+        uint32_t crc = 0;
+        std::array<unsigned char, 1024 * 1024> buf{};
         while (in) {
-            in.read(buf.data(), (std::streamsize)buf.size());
+            in.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)buf.size());
             const std::streamsize n = in.gcount();
-            if (n > 0) crc = ::crc32(crc, reinterpret_cast<const Bytef*>(buf.data()), (uInt)n);
+            if (n > 0) crc = crc32Chunk(crc, buf.data(), (size_t)n);
         }
         if (in.bad()) { error = "Read error"; return false; }
-        char hex[16]; std::snprintf(hex, sizeof(hex), "%08lx", (unsigned long)crc);
+        char hex[16]; std::snprintf(hex, sizeof(hex), "%08x", crc);
         out = hex;
         return true;
     }
@@ -2626,6 +2708,7 @@ static const char* convertFieldValue(const ExplorerState& s,int field) {
 }
 
 static std::vector<std::string> supportedImageSaveFormats() {
+#ifdef RAYMOTHFM_WITH_VIPS
     std::vector<std::string> out;
     gchar** suffixes = vips_foreign_get_suffixes();
     if (suffixes) {
@@ -2644,8 +2727,13 @@ static std::vector<std::string> supportedImageSaveFormats() {
     for(const char* x:preferred) if(std::find(out.begin(),out.end(),x)!=out.end()) ordered.push_back(x);
     for(const auto& x:out) if(std::find(ordered.begin(),ordered.end(),x)==ordered.end()) ordered.push_back(x);
     return ordered;
+#else
+    // The lite profile keeps the image viewer and thumbnails; conversion is optional.
+    return {};
+#endif
 }
 
+#ifdef RAYMOTHFM_WITH_VIPS
 static bool convertImageFile(ExplorerState& s, std::string& error) {
     if(s.convertInput.empty() || s.convertOutput.empty()) { error="Input/output is empty"; return false; }
     if(s.convertFormats.empty() || s.convertFormat < 0 || s.convertFormat >= (int)s.convertFormats.size()) { error="No output format selected"; return false; }
@@ -2689,12 +2777,26 @@ static bool convertImageFile(ExplorerState& s, std::string& error) {
     return true;
 }
 
+#else
+static bool convertImageFile(ExplorerState&, std::string& error) {
+    error = "Image conversion is not included in the lightweight build (rebuild with WITH_VIPS=1).";
+    return false;
+}
+#endif
+
 static void openConvertImage(ExplorerState& s) {
     const auto ids=selectedRows(s);
     if(ids.size()!=1 || !s.vfs || !s.vfs->isLocal() || s.rows[ids.front()].kind!=EntryKind::File || !isImagePath(s.rows[ids.front()].name)) { s.status="Select one local image"; return; }
     s.convertInput=s.rows[ids.front()].path;
     s.convertFormats=supportedImageSaveFormats();
-    if(s.convertFormats.empty()) { s.status="No libvips image savers are available"; return; }
+    if(s.convertFormats.empty()) {
+#ifndef RAYMOTHFM_WITH_VIPS
+        s.status="Image conversion is disabled in the lightweight build (WITH_VIPS=1 enables it)";
+#else
+        s.status="No supported image save formats are available";
+#endif
+        return;
+    }
     std::string ext=lowerCopy(fs::path(s.convertInput).extension().string()); if(!ext.empty()&&ext.front()=='.') ext.erase(ext.begin());
     s.convertFormat=0; for(size_t i=0;i<s.convertFormats.size();++i) if(s.convertFormats[i]==ext){s.convertFormat=(int)i;break;}
     const fs::path in(s.convertInput); s.convertOutput=(in.parent_path()/(in.stem().string()+"_converted."+s.convertFormats[s.convertFormat])).string();
@@ -2838,7 +2940,7 @@ static void drawModal(ExplorerState& s, int W,int H,const Theme& t) {
     if (s.modal==Modal::About) {
         DrawText("raymothfm",(int)box.x+20,(int)box.y+72, uiFont(30), t.text);
         DrawText("A fast Linux file manager built with raylib.",(int)box.x+20,(int)box.y+112, uiFont(14), t.muted);
-        DrawText("VFS / libarchive / libmagic / XDG integration / 7z / OpenSSL / libvips",(int)box.x+20,(int)box.y+138, uiFont(13), t.text);
+        DrawText("VFS / Raylib / libarchive / libmagic / XDG / OpenSSL",(int)box.x+20,(int)box.y+138, uiFont(13), t.text);
         DrawText(RAYMOTHFM_VERSION,(int)box.x+20,(int)box.y+164, uiFont(13), t.text);
         DrawText("Made with <3 by @HalanoSiblee The Smart Moth",(int)box.x+20,(int)box.y+190, uiFont(13), t.text);
         DrawText("F1 = shortcuts    Esc = close",(int)box.x+20,(int)box.y+220, uiFont(13), t.muted);
@@ -3457,7 +3559,9 @@ int main(int argc, char** argv) {
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     ThumbnailWorker thumbnailWorker;
     bool thumbnailServicesReady = false;
+#ifdef RAYMOTHFM_WITH_VIPS
     bool vipsReady = false;
+#endif
     MouseLaserTrail mouseLaser;
     EnableEventWaiting();
 
@@ -3854,6 +3958,7 @@ int main(int argc, char** argv) {
         // is visible. The window therefore appears immediately instead of showing a
         // loading screen while libvips initializes.
         if (!thumbnailServicesReady) {
+#ifdef RAYMOTHFM_WITH_VIPS
             if (vips_init("raymothfm") == 0) {
                 vips_concurrency_set((int)std::clamp(hw >= 4 ? 2u : 1u, 1u, 2u));
                 vips_cache_set_max(0);
@@ -3865,6 +3970,11 @@ int main(int argc, char** argv) {
                 st.status = "libvips initialization failed; image services unavailable";
                 thumbnailServicesReady = true;
             }
+#else
+            thumbnailWorker.start(hw >= 4 ? 2 : 1);
+            gThumbnailWorker = &thumbnailWorker;
+            thumbnailServicesReady = true;
+#endif
         }
 
         // ------------------------------------------------------------------
@@ -4114,7 +4224,9 @@ int main(int argc, char** argv) {
     if(st.imageTexture.id) UnloadTexture(st.imageTexture);
     thumbnailWorker.stop();
     gThumbnailWorker = nullptr;
+#ifdef RAYMOTHFM_WITH_VIPS
     if (vipsReady) vips_shutdown();
+#endif
     CloseWindow();
     return 0;
 }
