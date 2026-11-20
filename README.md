@@ -8,7 +8,8 @@ Next-Gen linux file manager Speed focused ⚡
 - Built-in image viewer
 - Built-in image converter
 - Built-in files checksum (md5 crc32 sha-1-256-512)
-- Lighting fast/small Libvips ⚡ thumbnail rendering and image viewer (avif jxl webp png bmp jpg etc)
+- Lightweight Raylib image decoder for common-format thumbnails and viewing (default)
+- Optional Libvips backend for extended image formats and image conversion (`WITH_VIPS=1`)
 - Libarchive cover various archive formats / standlone /w system clis
 - 7z/zstd/gz/xz/&more
 - Linux Kernel **VFS** 🐧
@@ -27,21 +28,30 @@ Next-Gen linux file manager Speed focused ⚡
 - Progressive rendering
 - MIME EDITOR
 
-# Dependency
+# Dependencies
 
-- Libmagic
-- Libvips
+Default lightweight build:
+
+- Raylib (static library recommended)
 - Libarchive
-- Raylib
-- 7z
-- Zstd
-- C++ 20
+- Libmagic
 - OpenSSL
+- C++20
 
-### build 
+Optional full image backend:
+
+- Libvips (`make WITH_VIPS=1`)
+
+External archive helpers such as 7z, zstd, and xz are optional and are only
+needed for the formats or operations that invoke them. CRC32 checksum support
+is built in and does not require a direct zlib development dependency.
+
+### Build
+
 ```sh
 make -j$(nproc)
 ```
+
 `./raymothfm --help`\
 `./raymothfm`\
 `./raymothfm --mkcfg`\
